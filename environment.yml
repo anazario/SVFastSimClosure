@@ -1,0 +1,26 @@
+# Reproducible environment for svclosure.
+# ROOT and XRootD come from conda-forge (not installable via pip), so the
+# environment is managed with conda/mamba rather than uv/pip.
+#
+#   conda env create -f environment.yml
+#   conda activate svclosure
+#   pip install -e .
+#
+# Versions pinned to the environment the study was developed with (2026-11-16).
+name: svclosure
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.16
+  - root=6.40.04
+  - xrootd=6.2.1
+  - uproot=5.7.7
+  - awkward=2.14.0
+  - numpy=2.5.4
+  - pandas=3.1.1
+  - matplotlib=3.11.2
+  - mplhep=1.3.3
+  - pyyaml=6.0.3
+  - fsspec-xrootd=0.5.5
+  - pytest=9.2.0
+  - pip

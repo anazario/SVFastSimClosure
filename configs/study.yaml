@@ -1,0 +1,38 @@
+# SV FullSim/FastSim yield-closure study configuration.
+# Paths may use ~.  Analysis/fit config paths are relative to llpcombine_dir.
+
+llpcombine_dir: ~/code/LLPCombine
+llpstandardplots_dir: ~/code/LLPStandardPlots
+
+analyses:
+  - mode: compressed
+    analysis_config: config_master/LittleGuy_Compressed_FullRegions_AnalysisConfig.yaml
+    fit_config: config_master/LittleGuy_Compressed_FullRegions_FitConfig.yaml
+  - mode: noncompressed
+    analysis_config: config_master/BigGuy_NonCompressed_FullRegions_AnalysisConfig.yaml
+    fit_config: config_master/BigGuy_NonCompressed_FullRegions_FitConfig.yaml
+
+samples:
+  # SampleTool::MasterDict keys. The FastSim files already carry the nominal
+  # mass-splitting-dependent S_xy correction from skimming (SxyScaleNominal):
+  # it is NOT applied again here.
+  fullsim_key: gogoGZ
+  fastsim_key: gogoGZFAST
+  expected_prefix: root://cmseos.fnal.gov//store/user/lpcsusylep/malazaro/KUCMSSkims/skims_v52/
+  tree: kuSkimTree
+  config_tree: kuSkimConfigTree
+
+weights:
+  # main.cpp defaults used when the analysis YAML has no decayWeights block
+  # (both master configs): decay reweighting 0.5/0.5 -> 0.5/0.5 is always on.
+  decay_defaults: {sample_z: 0.5, sample_g: 0.5, target_z: 0.5, target_g: 0.5}
+
+io:
+  workers: 3            # processes for event reading; start conservative for remote EOS
+  metadata_threads: 6   # concurrent config-tree reads while building the manifest
+  step_size: 100000     # entries per chunk (memory bound per worker)
+  task_entries: 400000  # entries per scheduled task (dynamic load balancing)
+  timeout: 120          # XRootD timeout [s]
+
+plot:
+  rlabel: "(13.6 TeV)"    # right-hand CMS label; set to the era/energy of the signal samples
