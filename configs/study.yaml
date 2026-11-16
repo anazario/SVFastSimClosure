@@ -36,3 +36,65 @@ io:
 
 plot:
   rlabel: "(13.6 TeV)"    # right-hand CMS label; set to the era/energy of the signal samples
+  # Figures for the nominal study use the regime-restricted pools below.  Set
+  # include_all_hypotheses_diagnostic to also draw the legacy pool of every hypothesis.
+  include_all_hypotheses_diagnostic: true
+  full_bin_name_figures: false   # also draw the original debugging figures with analysis bin names
+
+# Which signal hypotheses each analysis mode targets.  Delta m = m(N2) - m(N1) from the
+# sample manifest.  Public labels: "Compressed" and "High-Delta-m".
+signal_regimes:
+  dm_max_compressed: 200     # GeV, inclusive; LLPCombine macro/CalculateCutflowPiechart.py (dmass <= 200)
+  mode_of: {compressed: compressed, high_dm: noncompressed}
+  alternatives:              # other conventions in LLPCombine; disagreements are reported and excluded
+    - name: LifetimeEff.is_compressed   # macro/LifetimeEff.py: mGl-mN2 <= 100 and mN2-mN1 <= 100
+      max_mgl_minus_mn2: 100
+      max_mn2_minus_mn1: 100
+  benchmarks:                # macro/llpcombine.py limit-plot benchmarks (LittleGuy / BigGuy); must classify as listed
+    compressed: [[2300, 2200, 2100], [2300, 2250, 2200]]
+    high_dm: [[2300, 1300, 1000], [2500, 1200, 500]]
+  source_note: "LLPCombine ab3d959 macros; analysis configs carry no explicit Delta-m boundary"
+
+# Event-level lifetime reweighting (svclosure lifetime-scan).  Lifetimes are c*tau in cm.
+# The generated lifetime of every sample is read from its own file name (ct0p1 = 0.1 m = 10 cm).
+lifetime_scan:
+  targets:                   # generated (source) cm -> target cm; the target equal to the source is the direct reference
+    10: [1, 5, 10, 15]       # 15 is exploratory
+    50: [20, 30, 40, 50, 70] # 40 and 70 are exploratory
+  crosscheck_targets:        # processed in the same pass; only for direct-vs-reweighted comparisons, never nominal
+    50: [10]                 # 50 -> 10 cm vs direct 10 cm: cross-check
+    10: [50]                 # 10 -> 50 cm vs direct 50 cm: stress test (weights grow with t)
+  # Events with invalid Xa_ctau/Xb_ctau (non-finite, negative, zero) or not exactly one Evt_is* flag:
+  #   llpcombine: weight them exactly as LLPCombine does, and record them (default; keeps fit parity)
+  #   exclude:    drop them from every target (changes even the direct yields; recorded)
+  #   fail:       stop if any such event enters a selection
+  invalid_ctau_policy: llpcombine
+  quality:
+    min_neff: 10               # either sample below -> status low_stats (same as the unreweighted study)
+    min_neff_reweighted: 25    # minimum N_eff (both samples) for a reweighted point to be drawn as trustworthy
+    max_top1_sumw2_frac: 0.20  # largest single w^2 / sum w^2 above this -> weight_concentrated
+    max_top5_sumw2_frac: 0.50
+    topk: 10
+    # per-target verdict (lifetime_quality.csv), from regime-matched SFs whose direct reference is status ok:
+    target_usable_frac_channel: 0.90   # usable: >= 90% of channel-integrated SFs reliable ...
+    target_usable_frac_bin: 0.75       # ... and >= 75% of single-bin SFs reliable
+    target_limited_frac_channel: 0.50  # limited: >= 50% of channel SFs reliable; otherwise unreliable
+  representative_points:     # mass hypotheses (mode_mGl_mN2_mN1) for per-hypothesis lifetime figures
+    - gogoGZ_2300_2200_2100
+    - gogoGZ_2300_2250_2200
+    - gogoGZ_2300_1300_1000
+    - gogoGZ_2500_1200_500
+
+# Event-level category checks (svclosure run / lifetime-scan / overlaps).
+overlaps:
+  # Expected relation between selections that the fit treats as separate categories:
+  #   within a channel group (kinematic bins): disjoint is REQUIRED (structural; a violation fails the run)
+  #   between channel groups of one analysis mode, and between a high/low-S_xy partner pair:
+  #   disjoint is EXPECTED (violations are reported with their selections; set fail_on_unexpected to stop)
+  #   between analysis modes: overlap allowed (separate analyses), counts reported only
+  fail_on_unexpected: false
+  benchmark_points:          # representative points for the standalone overlap report
+    - gogoGZ_2300_2200_2100_10
+    - gogoGZ_2300_2200_2100_50
+    - gogoGZ_2300_1300_1000_10
+    - gogoGZ_2300_1300_1000_50

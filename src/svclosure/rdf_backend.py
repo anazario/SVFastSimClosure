@@ -10,6 +10,13 @@ It reproduces, for one signal file:
     own ``ReweightTool::DecayReweight`` (its header is #included read-only),
   * ``Filter(cuts)`` -> Count, Sum(evtrwt), Sum(evtrwt2),
 and also evaluates the symmetric (both-stripped) diagnostic mode.
+
+Lifetime targets (``spec["lifetime"] = {"source_cm": s, "targets": [...]}``) replay
+``BuildFitInput::BuildReweights`` line for line: ``float tau_old = float(sampleLifetime)``,
+``Define("xawt", [=](float ctau){ return ReweightTool::LifetimeReweight(ctau, tau_old, tau_new); },
+{"Xa_ctau"})``, the same for ``xbwt``, then ``evtrwt = evtwt*xawt*xbwt*decayWeight`` (JIT string).
+With ``spec["dump_weights"]`` the per-event xawt, xbwt and evtrwt of every target are written to
+``<out>.npz`` for an element-wise comparison.
 """
 from __future__ import annotations
 
@@ -59,6 +66,37 @@ def main(spec_path: str, out_path: str) -> int:
         f"ReweightTool::DecayReweight(Evt_isZZ, Evt_isGZ, Evt_isGG, {zo!r}, {zn!r}, {go!r}, {gn!r})",
     )
     node = node.Define("evtrwt", "evtwt*decayWeight").Define("evtrwt2", "evtrwt*evtrwt")
+    variants = [("noreweight", "evtrwt", None)]
+    lt = spec.get("lifetime")
+    if lt:
+        ROOT.gInterpreter.Declare(
+            r"""
+            ROOT::RDF::RNode svc_lifetime(ROOT::RDF::RNode df, const std::string& sfx, double sampleLifetime,
+                                          double targetLifetime){
+                float tau_old = float(sampleLifetime);   // BuildFitInput::BuildReweights
+                float tau_new = float(targetLifetime);
+                auto a = df.Define("xawt" + sfx, [=](float ctau){ return ReweightTool::LifetimeReweight(ctau, tau_old, tau_new); },
+                                   {"Xa_ctau"});
+                auto b = a.Define("xbwt" + sfx, [=](float ctau){ return ReweightTool::LifetimeReweight(ctau, tau_old, tau_new); },
+                                  {"Xb_ctau"});
+                auto c = b.Define("evtrwt" + sfx, "evtwt*xawt" + sfx + "*xbwt" + sfx + "*decayWeight");
+                return c.Define("evtrwt2" + sfx, "evtrwt" + sfx + "*evtrwt" + sfx);
+            }
+            """
+        )
+        node = ROOT.RDF.AsRNode(node)
+        for i, t in enumerate(lt["targets"]):
+            sfx = f"_t{i}"
+            node = ROOT.svc_lifetime(node, sfx, float(lt["source_cm"]), float(t))
+            variants.append((lt["variant_keys"][i], "evtrwt" + sfx, float(t)))
+    dumps = {}
+    if spec.get("dump_weights") and lt:
+        dumps["entry"] = node.Take["ULong64_t"]("rdfentry_")
+        dumps["evtrwt_noreweight"] = node.Take["double"]("evtrwt")
+        for i, (vk, col, t) in enumerate(variants[1:]):
+            dumps[f"xawt_{vk}"] = node.Take["float"](f"xawt_t{i}")
+            dumps[f"xbwt_{vk}"] = node.Take["float"](f"xbwt_t{i}")
+            dumps[f"evtrwt_{vk}"] = node.Take["double"](col)
 
     results = {}
     t0 = time.perf_counter()
@@ -68,7 +106,9 @@ def main(spec_path: str, out_path: str) -> int:
         cuts = {"parity": stripped if is_fastsim else full, "symmetric": stripped}
         for hlt, c in cuts.items():
             filt = node.Filter(c, f"{b['name']}_{hlt}")
-            results[(b["mode"], b["name"], hlt)] = (filt.Count(), filt.Sum("evtrwt"), filt.Sum("evtrwt2"), stripped)
+            for vk, col, _ in variants:
+                results[(b["mode"], b["name"], hlt, vk)] = (filt.Count(), filt.Sum(col), filt.Sum(col.replace("evtrwt", "evtrwt2", 1)),
+                                                            stripped)
     out = {
         "path": spec["path"],
         "sMCType": mctype,
@@ -79,11 +119,18 @@ def main(spec_path: str, out_path: str) -> int:
         "root_version": ROOT.gROOT.GetVersion(),
         "yields": [],
     }
-    for (mode, name, hlt), (cnt, s, s2, stripped) in results.items():
+    for (mode, name, hlt, vk), (cnt, s, s2, stripped) in results.items():
         out["yields"].append(
-            dict(mode=mode, bin=name, hlt=hlt, n_raw=int(cnt.GetValue()), sumw=float(s.GetValue()),
+            dict(mode=mode, bin=name, hlt=hlt, variant=vk, n_raw=int(cnt.GetValue()), sumw=float(s.GetValue()),
                  sumw2=float(s2.GetValue()), cpp_stripped=stripped)
         )
+    if dumps:
+        import numpy as np
+
+        np.savez_compressed(out_path.replace(".json", "") + ".npz",
+                            **{k: np.asarray(v.GetValue()) for k, v in dumps.items()})
+        out["weights_dump"] = out_path.replace(".json", "") + ".npz"
+    out["lifetime"] = lt
     out["seconds"] = time.perf_counter() - t0
     json.dump(out, open(out_path, "w"), indent=1)
     return 0

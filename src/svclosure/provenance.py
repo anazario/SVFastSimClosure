@@ -16,7 +16,15 @@ def _git(repo: Path, *args: str) -> str:
         return f"<error: {exc}>"
 
 
-def git_state(repo: str | Path, watch: list[str] | None = None) -> dict:
+def tracked_sources(repo: Path) -> list[str]:
+    """Every file of this package that can change a result (code, config, tools, tests)."""
+    out = []
+    for pat in ("src/svclosure/*.py", "configs/*.yaml", "tools/*", "tests/*.py", "pyproject.toml", "environment.yml"):
+        out += [str(p.relative_to(repo)) for p in sorted(repo.glob(pat)) if p.is_file()]
+    return out
+
+
+def git_state(repo: str | Path, watch: list[str] | None = None, diff_hash: bool = False) -> dict:
     repo = Path(repo).expanduser()
     if not (repo / ".git").exists():
         return {"path": str(repo), "git": False}
@@ -32,6 +40,13 @@ def git_state(repo: str | Path, watch: list[str] | None = None) -> dict:
         "n_untracked": sum(1 for l in status.splitlines() if l.startswith("??")),
         "remote": _git(repo, "config", "--get", "remote.origin.url"),
     }
+    if diff_hash:  # pins a dirty tree: hash of the uncommitted diff (tracked files) + untracked file list
+        diff = subprocess.run(["git", "-C", str(repo), "diff", "HEAD", "--binary"], capture_output=True).stdout
+        st["uncommitted_diff_sha256"] = hashlib.sha256(diff).hexdigest() if diff else None
+        st["uncommitted_diff_bytes"] = len(diff)
+        raw = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True).stdout
+        st["untracked"] = [l[3:] for l in raw.splitlines() if l.startswith("??")]
+        st["modified"] = [l[3:] for l in raw.splitlines() if l and not l.startswith("??")]
     if watch:  # the exact files this study reads: their own status and content hash
         files = {}
         for rel in watch:
@@ -60,6 +75,12 @@ def environment() -> dict:
     except Exception:
         env["XRootD_bindings"] = None
     return env
+
+
+def short_rev(state: dict) -> dict:
+    """Compact revision columns appended to every result table."""
+    return {"svclosure_commit": (state.get("commit") or "")[:12], "svclosure_dirty": bool(state.get("dirty")),
+            "svclosure_diff_sha256": (state.get("uncommitted_diff_sha256") or "")[:12]}
 
 
 def now() -> str:

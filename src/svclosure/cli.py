@@ -1,11 +1,21 @@
 """Command-line interface: ``svclosure <command> [options]``.
 
 Commands
-  manifest    build the resolved-bin and sample manifests (optionally open every file)
-  show-bins   print the resolved LLPCombine selection of every SV bin
-  validate    first-stage validation on one matched FullSim/FastSim point
-  run         process all matched points -> yields, SF tables, figures
-  plot        (re)make figures from an existing run directory
+  manifest       build the resolved-bin and sample manifests (optionally open every file)
+  show-bins      print the resolved LLPCombine selection of every SV bin
+  validate       validation on one matched FullSim/FastSim point: RDataFrame parity (direct and
+                 lifetime-reweighted, element-wise weights), optional LLPCombine-JSON comparison
+  run            process all matched points (generated lifetimes only) -> tables, figures
+  lifetime-scan  same files, every configured target lifetime in one pass -> lifetime tables, figures
+  plot           (re)make figures from an existing run directory
+
+Examples
+  svclosure run --workers 3
+  svclosure lifetime-scan --workers 3                              # targets from configs/study.yaml
+  svclosure lifetime-scan --targets "10:5,10;50:30,50"             # fewer targets
+  svclosure lifetime-scan --targets "10:2,5,10,15,20;50:10,20,30,40,50,70,100" --tag lifetime_wide
+  svclosure validate --point gogoGZ_2300_1300_1000_10              # + lifetime parity for 10 cm targets
+  svclosure plot --run results/<run-dir>
 """
 from __future__ import annotations
 
@@ -90,40 +100,68 @@ def cmd_show_bins(a) -> int:
     return 0
 
 
-def _yields_and_sf(study, points, bins, run, workers, step, task_entries):
-    yields, perf = P.run_yields(study, points, bins, workers, step, task_entries, log=_log)
-    yields.to_csv(run / "yields.csv", index=False)
-    (run / "perf.json").write_text(json.dumps(perf, indent=1, default=str))
-    bmeta = P.bin_frame(bins)
-    sf = stats.sf_table(yields, bmeta)
-    keys = [p.key for p in points]
-    sfp = stats.sf_table(stats.pooled(yields, keys), bmeta)
-    sf.to_csv(run / "sf.csv", index=False)
-    sfp.to_csv(run / "sf_pooled.csv", index=False)
-    return yields, perf, sf, sfp
+def _process(study, points, all_points, bins, run, workers, step, task_entries, prov, scan=None):
+    """One pass over the files -> every table (written to ``run``) -> (tables, YieldRun)."""
+    from . import bins as B
+    from . import lifetime as L
+    from . import outputs as O
+    from .provenance import short_rev
+
+    avail = set.intersection(*(set(p.fullsim_info["branches"]) & set(p.fastsim_info["branches"]) for p in points))
+    refs = B.reference_selections(bins, avail)
+    q = scan.quality if scan else L.from_config(study.raw.get("lifetime_scan")).quality
+    targets_of = None
+    if scan is not None:
+        def targets_of(p):
+            src = L.source_lifetime(p).cm
+            return src, scan.targets_for(src)
+    yr = P.run_yields(study, points, bins, workers, step, task_entries, log=_log, refs=refs, targets_of=targets_of,
+                      policy=scan.invalid_ctau_policy if scan else "llpcombine", topk=q.topk)
+    (run / "perf.json").write_text(json.dumps(yr.perf, indent=1, default=str))
+    pts = P.points_frame(all_points, study.regimes)
+    pts.to_csv(run / "manifest" / "points.csv", index=False)
+    pts = pts[pts.key.isin([p.key for p in points])]
+    rev = short_rev(prov["repos"]["SVFastSimClosure"])
+    tables = O.build(study, yr, bins, refs, points, pts, q, rev, scan=scan)
+    cfg = dict(quality=q.__dict__, lifetime_scan=scan.to_dict() if scan else None,
+               signal_regimes=study.raw.get("signal_regimes"), overlaps=study.raw.get("overlaps"),
+               reference_selections=[r.to_dict() for r in refs], points=[p.key for p in points],
+               hlt_modes=list(P.HLT_MODES))
+    O.write(run, tables, {"run_config": cfg})
+    O.overlap_matrices(run, yr, bins, (study.raw.get("overlaps") or {}).get("benchmark_points", []))
+    return tables, yr, pts
 
 
-def _plots(study, run: Path, sf: pd.DataFrame, sfp: pd.DataFrame, pts: pd.DataFrame, per_point: bool = True):
+def _overlap_verdict(study, tables) -> int:
+    summ = tables["overlap_summary"]
+    for k in ("structural_failures", "unexpected_overlaps", "unexpected_omissions"):
+        for r in summ.get(k, []):
+            _log(f"  {k[:-1].upper()}: {r}")
+    if summ["structural_failures"]:
+        _log("!! within-channel bins share events: structural failure")
+        return 3
+    if (study.raw.get("overlaps") or {}).get("fail_on_unexpected") and (summ["unexpected_overlaps"] or
+                                                                      summ["unexpected_omissions"]):
+        _log("!! unexpected overlaps/omissions and overlaps.fail_on_unexpected is set")
+        return 3
+    return 0
+
+
+def _plots(study, run: Path, tables: dict, pts: pd.DataFrame, per_point: bool = True, lifetime_figs: bool = False):
     from . import plotting
+    from . import lifetime_plots
 
-    rl = study.raw.get("plot", {}).get("rlabel", "(13.6 TeV)")
+    pc = study.raw.get("plot", {})
+    rl = pc.get("rlabel", "(13.6 TeV)")
     fig = run / "figures"
-    made = []
-    for hlt in ("parity", "symmetric"):
-        suffix = "" if hlt == "parity" else "_hltSymmetric"
-        pooled_title = f"Pooled over {int(pts.usable.sum())} matched signal hypothes{'is' if int(pts.usable.sum()) == 1 else 'es'}"
-        made += plotting.sf_plot(sfp, fig, f"sf_highSxy_pooled{suffix}", pooled_title, rl, hlt)
-        made += plotting.sf_plot(sfp, fig, f"sf_highSxy_pooled{suffix}_noBinNames", pooled_title, rl, hlt,
-                                 bin_names=False)
-        if sf.point.nunique() > 1:
-            made += plotting.heatmap(sf, pts, fig, f"sf_heatmap_highSxy{suffix}", rl, hlt, "high")
-            made += plotting.heatmap(sf, pts, fig, f"sf_heatmap_lowSxy{suffix}", rl, hlt, "low")
-            made += plotting.sf_vs_dm(sf, pts, fig, f"sf_vs_dm{suffix}", rl, hlt)
-    if per_point:
-        lab = dict(zip(pts.key, pts.short_label))
-        for pk in sorted(sf.point.unique()):
-            made += plotting.sf_plot(sf[sf.point == pk], fig / "per_point", f"sf_highSxy_{pk}",
-                                     f"gogoGZ {lab.get(pk, pk)}", rl, "parity")
+    made = plotting.study_figures(tables, pts, study.regimes, fig, rl, per_point=per_point,
+                                  all_hypotheses=pc.get("include_all_hypotheses_diagnostic", True),
+                                  full_names=pc.get("full_bin_name_figures", False))
+    if lifetime_figs and "lifetime_sf" in tables:
+        from . import lifetime as L
+
+        scan = L.from_config(study.raw.get("lifetime_scan"))
+        made += lifetime_plots.all_figures(tables, pts, study.regimes, scan, fig / "lifetime", rl)
     return made
 
 
@@ -145,7 +183,7 @@ def cmd_validate(a) -> int:
 
     inspect_points(sel, study.samples["tree"], study.samples["config_tree"], 2, study.io["timeout"])
     p = sel[0]
-    P.write_provenance(study, run, sys.argv)
+    prov = P.write_provenance(study, run, sys.argv)
     P.write_manifests(run, bins, problems, sel)
     _report_points(sel)
     if not p.usable:
@@ -171,8 +209,21 @@ def cmd_validate(a) -> int:
             return 3
 
     _log("\n--- uproot/awkward backend ---")
-    yields, perf, sf, sfp = _yields_and_sf(study, sel, bins, run, a.workers, study.io["step_size"],
-                                           study.io["task_entries"])
+    from . import lifetime as L
+
+    scan = None
+    sl = L.source_lifetime(p)
+    report["source_lifetime"] = sl.__dict__
+    _log(f"  generated lifetime: FullSim {sl.fullsim_cm} cm, FastSim {sl.fastsim_cm} cm, LLPCombine key {sl.key_cm} cm"
+         f" -> {'OK' if sl.ok else 'PROBLEM ' + str(sl.problem)}")
+    if not a.no_lifetime and sl.ok:
+        scan = L.from_config(study.raw.get("lifetime_scan"), a.targets)
+        if scan.targets_for(sl.cm) is None:
+            _log(f"  no lifetime targets configured for {sl.cm} cm: lifetime parity skipped")
+            scan = None
+    tables, yr, pts = _process(study, sel, sel, bins, run, a.workers, study.io["step_size"], study.io["task_entries"],
+                               prov, scan)
+    yields, perf, sf = yr.yields, yr.perf, tables["sf"]
     for f in perf["files"]:
         _log(f"  {f['sim']}: {f['entries']} entries, {f['bytes']/1e6:.1f} MB requested, read {f['read_s']:.1f}s "
              f"({(f['MBps_read'] or 0):.1f} MB/s), select {f['select_s']:.1f}s, zero-weight events {f['n_zero_weight']}, "
@@ -203,13 +254,28 @@ def cmd_validate(a) -> int:
 
     if not a.no_rdf:
         _log("\n--- RDataFrame replica of LLPCombine (separate process) ---")
-        cmp_all = []
+        cmp_all, wcmp = [], []
+        tg = scan.targets_for(sl.cm) if scan else []
+        lspec = dict(source_cm=sl.cm, targets=tg, variant_keys=[L.variant_key(t) for t in tg]) if tg else None
         for sim in ("fullsim", "fastsim"):
-            rdf = P.run_rdf_backend(study, getattr(p, sim), bins, run / "rdf", threads=a.rdf_threads)
-            up = yields[(yields.sim == sim)][["mode", "bin", "hlt", "n_raw", "sumw", "sumw2"]]
+            rdf = P.run_rdf_backend(study, getattr(p, sim), bins, run / "rdf", threads=a.rdf_threads,
+                                    lifetime_spec=lspec, dump_weights=bool(lspec) and not a.rdf_threads)
+            up = yields[(yields.sim == sim) & (yields.kind == "bin")][["mode", "bin", "hlt", "variant", "n_raw", "sumw", "sumw2"]]
             c = P.compare_backends(up, rdf)
             c["sim"] = sim
             cmp_all.append(c)
+            if rdf.get("weights_dump"):
+                w = P.compare_weight_dump(rdf["weights_dump"], getattr(p, sim), study.samples["tree"],
+                                          study.analyses[0].weights, sl.cm, tg, study.io["timeout"])
+                w["sim"] = sim
+                wcmp.append(w)
+                for r in w.itertuples():
+                    _log(f"    {sim} weights {r.column:18s} target {r.target_ctau_cm}: {r.n_bitwise_equal}/{r.n} bitwise equal,"
+                         f" max ulp(float32) {r.max_ulp_float32}, max rel diff {r.max_rel_diff:.2e}")
+                report["checks"][f"lifetime_weights_bitwise_{sim}"] = bool((w.n_bitwise_equal == w.n).all())
+            for vk, g in c.groupby("variant"):
+                _log(f"    {sim} {vk:12s}: {int(g.ok.sum())}/{len(g)} agree; counts identical {int(g.n_match.sum())}/{len(g)};"
+                     f" max |rel diff| sumw {g.sumw_reldiff.abs().max():.1e}, sumw2 {g.sumw2_reldiff.abs().max():.1e}")
             strip_ok = all(y["cpp_stripped"] == next(b.expression_no_hlt for b in bins if b.name == y["bin"] and b.mode == y["mode"])
                            for y in rdf["yields"])
             _log(f"  {sim}: RDF sMCType={rdf['sMCType']} is_fastsim={rdf['is_fastsim']}  {rdf['wall_s']:.1f}s  "
@@ -220,6 +286,8 @@ def cmd_validate(a) -> int:
             for r in c[~c.ok].itertuples():
                 _log(f"    MISMATCH {r.mode}/{r.bin}/{r.hlt}: uproot n={r.up_n} w={r.up_sumw!r}  rdf n={r.rdf_n} w={r.rdf_sumw!r}")
         pd.concat(cmp_all).to_csv(run / "parity_uproot_vs_rdf.csv", index=False)
+        if wcmp:
+            pd.concat(wcmp).to_csv(run / "parity_lifetime_weights_eventwise.csv", index=False)
 
     if a.compare_json:
         _log("\n--- comparison with existing LLPCombine JSON ---")
@@ -238,8 +306,8 @@ def cmd_validate(a) -> int:
     for r in show.itertuples():
         _log(f"  {r.mode:13s} {r.bin:40s} {r.role:6s} {r.hlt:9s} full n={r.full_n_raw:5d} Y={r.full_sumw:.4g}±{r.full_err:.2g}"
              f"  fast n={r.fast_n_raw:5d} Y={r.fast_sumw:.4g}±{r.fast_err:.2g}  SF={r.sf:.3f}±{r.sf_err:.3f} {r.status}")
-    pts = P.points_frame(sel)
-    made = _plots(study, run, sf, sfp, pts, per_point=False)
+    report["checks"]["overlaps_ok"] = _overlap_verdict(study, tables) == 0
+    made = _plots(study, run, tables, pts, per_point=False, lifetime_figs=False)
     report["figures"] = [str(m) for m in made]
     report["seconds"] = time.perf_counter() - t0
     (run / "validation.json").write_text(json.dumps(report, indent=1, default=str))
@@ -247,39 +315,100 @@ def cmd_validate(a) -> int:
     return 0 if all(report["checks"].values()) else 5
 
 
-def cmd_run(a) -> int:
+def _scan_common(a, scan=None, tag=None) -> int:
     study = P.load_study(a.config)
     bins, problems = P.resolve_all_bins(study)
-    if problems:
-        _log(f"bin structure problems: {problems}")
+    if problems:  # structural bin failures stop the production scan
+        for pr in problems:
+            _log(f"STRUCTURE PROBLEM: {pr}")
+        raise SystemExit("bin structure problems: refusing to run (see above)")
     points = P.discover_points(study, inspect=True)
     _report_points(points)
     sel = _select_points(points, a.points)
-    run = P.new_run_dir(Path(a.results), a.tag)
-    P.write_provenance(study, run, sys.argv)
+    if scan is not None:
+        from . import lifetime as L
+
+        keep = []
+        for p in sel:
+            sl = L.source_lifetime(p)
+            if not sl.ok:
+                _log(f"  SKIP {p.key}: generated lifetime check failed: {sl.problem}")
+            elif scan.targets_for(sl.cm) is None:
+                _log(f"  SKIP {p.key}: no targets configured for generated lifetime {sl.cm:g} cm")
+            else:
+                keep.append(p)
+        sel = keep
+        if not sel:
+            raise SystemExit("no points with configured source lifetimes")
+        _log("lifetime scan: " + "; ".join(f"{s:g} cm -> {scan.targets_for(s)}" for s in scan.targets)
+             + f"  (policy for invalid Xa/Xb_ctau: {scan.invalid_ctau_policy})")
+    run = P.new_run_dir(Path(a.results), tag or a.tag)
+    prov = P.write_provenance(study, run, sys.argv)
     P.write_manifests(run, bins, problems, points)
     workers = a.workers or study.io["workers"]
-    yields, perf, sf, sfp = _yields_and_sf(study, sel, bins, run, workers, a.step_size or study.io["step_size"],
-                                           a.task_entries or study.io["task_entries"])
+    tables, yr, pts = _process(study, sel, points, bins, run, workers, a.step_size or study.io["step_size"],
+                               a.task_entries or study.io["task_entries"], prov, scan)
+    perf = yr.perf
     _log(f"wall {perf['wall_s']:.1f}s, {perf['total_bytes']/1e9:.2f} GB requested, "
          f"aggregate {(perf['aggregate_MBps'] or 0):.1f} MB/s with {workers} workers")
     bad = [f for f in perf["files"] if f["errors"]]
     for f in bad:
         _log(f"  ERRORS {f['point']} {f['sim']}: {f['errors']}")
-    pts = P.points_frame(points)
-    pts = pts[pts.key.isin([p.key for p in sel])]
-    _plots(study, run, sf, sfp, pts)
+    an = yr.files.filter(like="n_ctau").sum().to_dict() if len(yr.files) else {}
+    _log(f"lifetime-input anomalies (all skimmed events): {an}; events listed in lifetime_anomalies.csv: {len(yr.anomalies)}")
+    if scan is not None:
+        chk = tables["lifetime_checks"]["direct_target_equals_noreweight"]
+        _log(f"direct target == no-reweight: {chk['bitwise_equal']}/{chk['rows']} rows bitwise identical")
+        q = tables["lifetime_quality"]
+        for r in q[q.level == "channel"].itertuples():
+            _log(f"  {r.source_ctau_cm:g} -> {r.target_ctau_cm:g} cm [{r.mode}]: {r.n_reliable}/{r.n_direct_ok} channel SFs "
+                 f"reliable, median N_eff ratio {r.median_neff_ratio:.2f} -> {r.verdict}")
+    rc = _overlap_verdict(study, tables)
+    if not a.no_plots:
+        _plots(study, run, tables, pts, per_point=True, lifetime_figs=scan is not None)
     _log(f"-> {run}")
-    return 1 if bad else 0
+    return 1 if bad else rc
+
+
+def cmd_run(a) -> int:
+    return _scan_common(a)
+
+
+def cmd_lifetime_scan(a) -> int:
+    from . import lifetime as L
+
+    study = P.load_study(a.config)
+    scan = L.from_config(study.raw.get("lifetime_scan"), a.targets, min_neff=a.min_neff,
+                         min_neff_reweighted=a.min_neff_reweighted, max_top1_sumw2_frac=a.max_top1)
+    if a.invalid_ctau_policy:
+        scan.invalid_ctau_policy = a.invalid_ctau_policy
+    if a.no_crosscheck:
+        scan.crosscheck_targets = {}
+    problems = scan.validate()
+    if problems:
+        raise SystemExit("invalid lifetime scan: " + "; ".join(problems))
+    return _scan_common(a, scan, a.tag)
+
+
+def _read_tables(run: Path) -> dict:
+    t = {}
+    for p in run.glob("*.csv"):
+        t[p.stem] = pd.read_csv(p)
+    for p in run.glob("*.json"):
+        if p.stem in ("overlap_summary", "lifetime_checks"):
+            t[p.stem] = json.loads(p.read_text())
+    return t
 
 
 def cmd_plot(a) -> int:
     study = P.load_study(a.config)
     run = Path(a.run)
-    sf, sfp = pd.read_csv(run / "sf.csv"), pd.read_csv(run / "sf_pooled.csv")
+    tables = _read_tables(run)
+    if "sf_channel" not in tables:
+        raise SystemExit(f"{run} predates the current output layout; rerun 'svclosure run' (see README: migration)")
     pts = pd.read_csv(run / "manifest" / "points.csv")
-    pts = pts[pts.key.isin(sf.point.unique())]
-    for m in _plots(study, run, sf, sfp, pts, per_point=not a.no_per_point):
+    pts = pts[pts.key.isin(tables["sf"].point.unique())]
+    for m in _plots(study, run, tables, pts, per_point=not a.no_per_point, lifetime_figs="lifetime_sf" in tables):
         _log(str(m))
     return 0
 
@@ -307,15 +436,33 @@ def main(argv=None) -> int:
     s.add_argument("--rdf-threads", type=int, default=0, help="ROOT implicit MT threads in the RDF process (0 = off)")
     s.add_argument("--compare-json", help="existing LLPCombine output JSON")
     s.add_argument("--compare-config", help="analysis config that produced --compare-json")
+    s.add_argument("--no-lifetime", action="store_true", help="skip the lifetime-reweighting parity checks")
+    s.add_argument("--targets", help="lifetime targets for the parity check (default: lifetime_scan.targets)")
     s.set_defaults(func=cmd_validate)
 
-    s = sub.add_parser("run", help="process all matched points")
-    s.add_argument("--points", default="all", help="'all' or comma-separated keys")
-    s.add_argument("--workers", type=int)
-    s.add_argument("--step-size", type=int)
-    s.add_argument("--task-entries", type=int)
-    s.add_argument("--tag", default="scan")
+    def common(s, tag):
+        s.add_argument("--points", default="all", help="'all' or comma-separated keys")
+        s.add_argument("--workers", type=int)
+        s.add_argument("--step-size", type=int)
+        s.add_argument("--task-entries", type=int)
+        s.add_argument("--tag", default=tag, help=f"run-directory suffix (default {tag})")
+        s.add_argument("--no-plots", action="store_true")
+
+    s = sub.add_parser("run", help="process all matched points at their generated lifetimes")
+    common(s, "scan")
     s.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("lifetime-scan", help="event-level lifetime reweighting to every configured target",
+                       description="Every file is read once; masks are evaluated once per chunk and all target "
+                                   "lifetimes are accumulated together.  Lifetimes in cm.")
+    common(s, "lifetime")
+    s.add_argument("--targets", help='source:targets map, e.g. "10:1,5,10,15;50:20,30,40,50,70" (overrides the YAML)')
+    s.add_argument("--min-neff", type=float, help="status low_stats below this N_eff (default from YAML)")
+    s.add_argument("--min-neff-reweighted", type=float, help="N_eff needed to draw a reweighted point as trustworthy")
+    s.add_argument("--max-top1", type=float, help="max single-event fraction of sum w^2 before weight_concentrated")
+    s.add_argument("--invalid-ctau-policy", choices=["llpcombine", "exclude", "fail"])
+    s.add_argument("--no-crosscheck", action="store_true", help="drop lifetime_scan.crosscheck_targets (50->10, 10->50)")
+    s.set_defaults(func=cmd_lifetime_scan)
 
     s = sub.add_parser("plot", help="remake figures for a run directory")
     s.add_argument("--run", required=True)
