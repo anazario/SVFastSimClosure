@@ -142,3 +142,80 @@ def test_reference_run_direct_points_match_direct_tables():
     for c in ("sf", "sf_err", "full_sumw", "fast_sumw"):
         np.testing.assert_allclose(direct[c], ref[c], rtol=1e-12)
     assert (direct.sf_class == ref.sf_class).all()
+
+
+EXPECTED_LABELS = {
+    ("compressed", "SVonly_SR:SR"): "SV only",
+    ("compressed", "MixPrompt_SR:SR"): r"SV + $\gamma_{\mathrm{p}}$",
+    ("compressed", "MixDel_SR:SR"): r"SV + $\gamma_{\mathrm{d}}$",
+    ("noncompressed", "Ch2SRGeLep1:SR"): "Lep SV",
+    ("noncompressed", "Ch4SRGeHad1:SR"): "Had SV",
+    ("noncompressed", "Ch14SRgeq1SVHighDxygeq1PhoNotBHLate:SR"): r"SV + $\gamma_{\mathrm{d}}$",
+}
+
+
+def test_single_label_mapping():
+    from svclosure.bins import display_label
+
+    assert {k: plotting.sr_label(*k) for k in SR_SUMMARY_GROUPS} == EXPECTED_LABELS
+    assert all(display_label(*k) == v for k, v in EXPECTED_LABELS.items())
+    with pytest.raises(ValueError):  # a group is tied to its analysis mode
+        display_label("noncompressed", "MixDel_SR:SR")
+
+
+def _capture(monkeypatch, module):
+    figs = []
+    monkeypatch.setattr(module, "_save", lambda fig, out, stem: figs.append(fig) or [])
+    return figs
+
+
+def test_figures_use_shared_labels_and_only_used_legend_entries(monkeypatch, tmp_path):
+    figs = _capture(monkeypatch, plotting)
+    plotting.sf_sr_regions_direct(_table(False), REGIMES, tmp_path, "direct", "(13.6 TeV)")
+    ax = figs[0].axes[0]
+    assert [t.get_text() for t in ax.get_xticklabels()] == [EXPECTED_LABELS[k] for k in SR_SUMMARY_GROUPS]
+    leg = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert len(leg) == 3 and all("generated" in x for x in leg[:2]) and "reference tolerance" in leg[2]
+    assert not any("(" in x for x in leg)
+
+    figs = _capture(monkeypatch, lifetime_plots)
+    t = _table(True)
+    t.loc[t.target_ctau_cm == 1.0, ["sf", "sf_err", "sf_class", "status"]] = [20.0, 9.0, "low_stats", "low_stats"]
+    lifetime_plots.sf_sr_regions_vs_ctau(t, REGIMES, SimpleNamespace(targets=TARGETS, quality=L.Quality()), tmp_path,
+                                         "v", "(13.6 TeV)")
+    f = figs[0]
+    titles = [a.get_title() for a in f.axes if a.get_visible() and a.get_title()]
+    assert titles == [EXPECTED_LABELS[k] for k in SR_SUMMARY_GROUPS]
+    leg = [x.get_text() for x in f.legends[0].get_texts()]
+    assert len(leg) == 4 and "directly generated MC" in leg and any("reference tolerance" in x for x in leg)
+    assert not any(a.texts for a in f.axes)  # no off-scale value annotations remain
+
+
+def test_lifetime_figure_omits_only_unreliable_reweighted_points():
+    t = _table(True)
+    bad = (t.target_ctau_cm.isin([1.0, 70.0])) & (t.role == "channel_sr")
+    t.loc[bad, ["sf_class", "status"]] = ["low_stats", "weight_concentrated"]
+    t.loc[(t.target_ctau_cm == 10.0) & (t.source_ctau_cm == 10.0) & (t.bin == "SVonly_SR:SR"), "sf_class"] = "low_stats"
+    shown, omitted = lifetime_plots.sr_vs_ctau_points(sr_summary_rows(t, REGIMES, targets=TARGETS))
+    assert len(omitted) == 12 and set(omitted.target_ctau_cm) == {1.0, 70.0}
+    assert (omitted.sf_class != "reliable").all() and (omitted.target_role == "nominal").all()
+    assert (shown.target_role == "direct").sum() == 12  # direct MC always visible, even when not reliable
+    rw = shown[shown.target_role == "nominal"]
+    assert (rw.sf_class == "reliable").all()
+
+
+@pytest.mark.skipif(not (RUN / "lifetime_sf_channel_pooled_regime.csv").exists(), reason="reference run not present")
+def test_reference_run_omitted_points():
+    import json
+
+    scan = L.from_dict(json.loads((RUN / "run_config.json").read_text())["lifetime_scan"])
+    raw = pd.read_csv(RUN / "lifetime_sf_channel_pooled_regime.csv")
+    shown, omitted = lifetime_plots.sr_vs_ctau_points(sr_summary_rows(raw, REGIMES, targets=scan.targets))
+    assert len(omitted) == 6 and (omitted.sf_class == "low_stats").all()
+    assert sorted(zip(omitted.bin, omitted.target_ctau_cm)) == sorted(
+        [(b, 1.0) for _, b in SR_SUMMARY_GROUPS if b != "Ch4SRGeHad1:SR"] + [("MixPrompt_SR:SR", 70.0)])
+    assert (shown.target_role == "direct").sum() == 12
+    ref = raw.set_index(["mode", "bin", "pool", "hlt", "role", "sxy", "target_ctau_cm"])
+    m = shown.set_index(["mode", "bin", "pool", "hlt", "role", "sxy", "target_ctau_cm"])
+    np.testing.assert_array_equal(m.sf, ref.loc[m.index].sf)
+    np.testing.assert_array_equal(m.sf_err, ref.loc[m.index].sf_err)

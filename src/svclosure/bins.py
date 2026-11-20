@@ -29,22 +29,41 @@ SV_FLAG_RE = re.compile(r"^passN\w+?(High|Low)DxySig(SR|CR)$")
 
 # Display names only (taken from LLPStandardPlots fit_plotter.py conventions, translated
 # from ROOT TLatex to mathtext).  They never influence a selection.
-GROUP_DISPLAY = {
-    # noncompressed: SR channel -> label
+GP, GD = r"$\gamma_{\mathrm{p}}$", r"$\gamma_{\mathrm{d}}$"
+GROUP_DISPLAY = {  # the single authoritative group -> display-label mapping (group names are mode specific)
+    # noncompressed (High-Delta-m): SR channel -> label
     "Ch2SRGeLep1": "Lep SV",
     "Ch4SRGeHad1": "Had SV",
-    "Ch14SRgeq1SVHighDxygeq1PhoNotBHLate": r"SV+$\gamma_{d}$",
+    "Ch14SRgeq1SVHighDxygeq1PhoNotBHLate": f"SV + {GD}",
     "Ch1CRGeLep1": "Lep SV",
     "Ch3CRGeHad1": "Had SV",
-    "Ch13CRgeq1SVLowDxygeq1PhoNotBHLate": r"SV+$\gamma_{d}$",
+    "Ch13CRgeq1SVLowDxygeq1PhoNotBHLate": f"SV + {GD}",
     # compressed
     "SVonly_SR": "SV only",
-    "MixDel_SR": r"$\gamma_{d}$+SV",
-    "MixPrompt_SR": r"$\gamma_{p}$+SV",
+    "MixDel_SR": f"SV + {GD}",
+    "MixPrompt_SR": f"SV + {GP}",
     "SVonly_AnchorCR": "SV only",
-    "MixDel_AnchorCR": r"$\gamma_{d}$+SV",
-    "MixPrompt_AnchorCR": r"$\gamma_{p}$+SV",
+    "MixDel_AnchorCR": f"SV + {GD}",
+    "MixPrompt_AnchorCR": f"SV + {GP}",
 }
+GROUP_MODE = {  # analysis mode of each channel group (for display_label's consistency check)
+    **{g: "noncompressed" for g in ("Ch2SRGeLep1", "Ch4SRGeHad1", "Ch14SRgeq1SVHighDxygeq1PhoNotBHLate", "Ch1CRGeLep1",
+                                    "Ch3CRGeHad1", "Ch13CRgeq1SVLowDxygeq1PhoNotBHLate")},
+    **{g: "compressed" for g in ("SVonly_SR", "MixDel_SR", "MixPrompt_SR", "SVonly_AnchorCR", "MixDel_AnchorCR",
+                                 "MixPrompt_AnchorCR")},
+}
+
+
+def display_label(mode: str, group_or_bin: str) -> str:
+    """Display label of an (analysis mode, channel group); a bin name ``group:...`` is accepted.
+
+    Looked up live from GROUP_DISPLAY (never from the ``group_display`` column cached in a run's CSVs)."""
+    g = group_or_bin.split(":")[0]
+    if GROUP_MODE.get(g, mode) != mode:
+        raise ValueError(f"group {g!r} belongs to {GROUP_MODE[g]!r}, not {mode!r}")
+    return GROUP_DISPLAY.get(g, g)
+
+
 GROUP_CHANNEL_TYPE = {  # SV-only vs SV+photon, for bookkeeping in the report
     "Ch2SRGeLep1": "SV-only",
     "Ch4SRGeHad1": "SV-only",

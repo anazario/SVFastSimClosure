@@ -60,6 +60,12 @@ def _fig_cms(fig, rlabel: str, y: float = 0.955, x0: float = 0.125, x1: float = 
     fig.text(x1, y, rlabel, fontsize=20, ha="right", va="bottom")
 
 
+def _guide_grid(ax):
+    """Light x-y grid at the major ticks, behind the data (SR summary figures)."""
+    ax.set_axisbelow(True)
+    ax.grid(True, which="major", axis="both", color="0.82", lw=0.8, ls="--")
+
+
 def _unity_band(ax, label: bool = False):
     ax.axhspan(1 - BAND_FRAC, 1 + BAND_FRAC, color="0.6", alpha=0.25, lw=0, zorder=0,
                label=(rf"$\pm{BAND_FRAC * 100:.0f}\%$ reference tolerance (not a fit)") if label else None)
@@ -549,7 +555,15 @@ SR_SUMMARY_GROUPS = (
 HYP_PARTIAL_FRAC = 0.5
 SR_SF_LABEL = r"$\mathrm{SF}_{\mathrm{SR}} = Y^{\mathrm{SR}}_{\mathrm{FullSim}}\,/\,Y^{\mathrm{SR}}_{\mathrm{FastSim,corr}}$"
 SOURCE_COLOR = {10.0: "#3f90da", 50.0: "#bd1f01"}
-SOURCE_MARKER = {10.0: "o", 50.0: "D"}
+SOURCE_MARKER = "o"  # reweighted points, both sources (colour gives the generated sample); direct MC: star
+SOURCE_LABEL = r"generated c$\tau$ = {:g} cm"
+
+
+def sr_label(mode: str, bin_name: str) -> str:
+    """Display label of an SR group; the one mapping used by both SR summary figures."""
+    from .bins import display_label
+
+    return display_label(mode, bin_name)
 
 
 def sr_display_class(d: pd.DataFrame) -> np.ndarray:
@@ -705,55 +719,44 @@ def sf_sr_regions_direct(t: pd.DataFrame, regimes, out: Path, stem: str, rlabel:
     xg = {k: i + gap * modes.index(k[0]) for i, k in enumerate(groups)}
     srcs = sorted(d.source_ctau_cm.unique())
     ylo, yhi = sr_ylim(d.sf, d.sf_err, d.display_class)
-    ymax = yhi + 0.17 * (yhi - ylo)  # headroom for the mode titles
+    ymax = yhi + 0.12 * (yhi - ylo)  # headroom for the mode titles
     fig, ax = plt.subplots(figsize=(12, 7.6))
     _unity_band(ax)
     counts = dict(clipped=0, bar_clipped=0, undefined=0, partial=0, low_stats=0)
     for k, src in enumerate(srcs):
         g = d[np.isclose(d.source_ctau_cm, src)]
         xs = np.array([xg[kk] for kk in zip(g["mode"], g.bin)]) + (k - (len(srcs) - 1) / 2) * 0.24
-        c = draw_sr_points(ax, xs, g, SOURCE_COLOR.get(src, PETROFF[4]), SOURCE_MARKER.get(src, "s"), (ylo, ymax), ms=11)
+        color = SOURCE_COLOR.get(src, PETROFF[4])
+        c = draw_sr_points(ax, xs, g, color, SOURCE_MARKER, (ylo, ymax), ms=10)
         counts = {kk: counts[kk] + c[kk] for kk in counts}
-        for xi, r in zip(xs, g.itertuples(index=False)):  # constituent-hypothesis reliability, when incomplete
-            if r.n_hyp_reliable < r.n_hyp_total:
-                ax.annotate(f"{r.n_hyp_reliable:.0f}/{r.n_hyp_total:.0f} hyp.\nreliable", (xi, r.sf - r.sf_err),
-                            xytext=(0, -6), textcoords="offset points", ha="center", va="top", fontsize=10.5,
-                            color="0.25")
     ax.set_ylim(ylo, ymax)
     xs_all = list(xg.values())
     ax.set_xlim(min(xs_all) - 0.55, max(xs_all) + 0.55)
     ax.set_xticks(xs_all)
-    disp = d.drop_duplicates(["mode", "bin"]).set_index(["mode", "bin"]).group_display
-    ax.set_xticklabels([disp[k] for k in groups], fontsize=18)
+    ax.set_xticklabels([sr_label(*k) for k in groups], fontsize=18)
     ax.tick_params(axis="x", which="both", top=False, bottom=False)
     import matplotlib.transforms as mtrans
 
     tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
     for i, m in enumerate(modes):
         xm = [xg[k] for k in groups if k[0] == m]
-        nh = int(d[d["mode"] == m].n_hyp_total.iloc[0])
-        regime = [r for r, mm in regimes.mode_of.items() if mm == m][0]
         ax.text(np.mean(xm), 0.955, f"{MODE_TITLE[m]} analysis", transform=tr, ha="center", va="top", fontsize=19,
                 fontweight="bold")
-        ax.text(np.mean(xm), 0.885, f"{nh} {REGIME_PUBLIC[regime]} mass hypotheses", transform=tr, ha="center",
-                va="top", fontsize=13, color="0.25")
         if i:
             ax.axvline(min(xm) - (1 + gap) / 2, color="black", lw=2.5)
-    ax.set_ylabel(SR_SF_LABEL, fontsize=21)
+    ax.set_ylabel(SR_SF_LABEL, fontsize=21, loc="center")
+    _guide_grid(ax)
     _cms(ax, rlabel)
-    h = [Line2D([], [], color=SOURCE_COLOR.get(s, PETROFF[4]), marker=SOURCE_MARKER.get(s, "s"), ms=10, lw=2,
-                label=rf"generated c$\tau$ = {s:g} cm") for s in srcs]
-    h.append(Patch(color="0.6", alpha=0.25, lw=0, label=rf"$\pm${BAND_FRAC:.0%} reference tolerance (not a fitted uncertainty)"))
-    h += sr_class_handles(counts)[1:]
-    ax.legend(handles=h, loc="upper center", bbox_to_anchor=(0.5, -0.07), ncol=2 if len(h) > 3 else 3,
-              frameon=False, fontsize=13.5)
-    note = (r"High-$S_{xy}$ signal regions, channel-integrated. Each point is a ratio of summed yields over the "
-            "mass hypotheses\nof its analysis mode at one generated lifetime; per-region values, not a common SF. "
-            "Statistical uncertainties only\n(error bars hidden where smaller than the marker).")
-    if counts["clipped"] or counts["bar_clipped"]:
-        note += f"\n{counts['clipped'] + counts['bar_clipped']} value(s)/uncertainties extend beyond the y range."
-    ax.text(0.0, -0.13 - 0.055 * int(np.ceil(len(h) / (2 if len(h) > 3 else 3))), note, fontsize=12.5, ha="left",
-            va="top", transform=ax.transAxes)
+    h = [Line2D([], [], color=SOURCE_COLOR.get(s, PETROFF[4]), marker=SOURCE_MARKER, ms=10, lw=2,
+                label=SOURCE_LABEL.format(s)) for s in srcs]
+    h.append(Patch(color="0.6", alpha=0.25, lw=0, label=rf"$\pm${BAND_FRAC:.0%} reference tolerance"))
+    h += sr_class_handles(counts)[1:]  # only quality classes that actually occur (none for the reference run)
+    ax.legend(handles=h, loc="upper center", bbox_to_anchor=(0.5, -0.075), ncol=2, frameon=False, fontsize=14,
+              columnspacing=1.5)
+    if counts["clipped"] or counts["bar_clipped"]:  # never clip silently (does not occur for the reference run)
+        ax.text(0.0, -0.13 - 0.06 * int(np.ceil(len(h) / 2)), f"{counts['clipped'] + counts['bar_clipped']} "
+                "value(s)/uncertainties extend beyond the y range.", fontsize=12.5, ha="left", va="top",
+                transform=ax.transAxes)
     return _save(fig, out, stem)
 
 
