@@ -19,8 +19,9 @@ from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter, NullFormatter
 
-from .plotting import (MODE_ORDER, MODE_TITLE, REGIME_PUBLIC, SF_LABEL, _fig_cms, _ordered, _save, _style, _unity_band,
-                       auto_ylim, class_legend_handles, draw_measurements, plt)
+from .plotting import (BAND_FRAC, MODE_ORDER, MODE_TITLE, REGIME_PUBLIC, SF_LABEL, _fig_cms, _ordered, _save, _style, _unity_band,
+                       auto_ylim, class_legend_handles, draw_measurements, draw_sr_points, plt, sr_class_handles,
+                       sr_summary_rows, sr_ylim)
 
 SOURCE_STYLE = {10.0: dict(color="#3f90da", marker="o"), 50.0: dict(color="#bd1f01", marker="D")}
 DIRECT_STYLE = dict(marker="*", ms=19, mec="black", mew=1.2, zorder=6)
@@ -308,6 +309,86 @@ def _chan_label(k: str) -> str:
     return f"{MODE_TITLE[mode]}: {GROUP_DISPLAY.get(g, g)}" + (" (SR)" if b.endswith(":SR") else "")
 
 
+def sf_sr_regions_vs_ctau(t: pd.DataFrame, regimes, scan, out: Path, stem: str, rlabel: str,
+                          hlt: str = "parity") -> list[Path]:
+    """Figure 2: channel-integrated SR SF vs target c*tau, 2 x 3 grid (rows = analysis modes).
+
+    Input: ``lifetime_sf_channel_pooled_regime.csv``, direct and nominal targets only.  One series per
+    generated sample (thin line within a sample only; the two samples are never joined); the directly
+    generated lifetime is a star.  Shared log axes; no fit, no smoothing."""
+    _style()
+    d = sr_summary_rows(t, regimes, hlt, targets=scan.targets)
+    groups = list(dict.fromkeys(zip(d["mode"], d.bin)))
+    modes = [m for m in MODE_ORDER if m in set(d["mode"])]
+    ncol = max(sum(k[0] == m for k in groups) for m in modes)
+    ylim = sr_ylim(d.sf, d.sf_err, d.display_class, log=True)
+    fig, axes = plt.subplots(len(modes), ncol, figsize=(5.6 * ncol + 1.2, 5.0 * len(modes) + 2.4), squeeze=False,
+                             sharex=True, sharey=True)
+    fig.subplots_adjust(hspace=0.24, wspace=0.07, top=0.845, bottom=0.2, left=0.1, right=0.97)
+    targets = sorted(d.target_ctau_cm.unique())
+    counts = dict(clipped=0, bar_clipped=0, undefined=0, partial=0, low_stats=0)
+    disp = d.drop_duplicates(["mode", "bin"]).set_index(["mode", "bin"]).group_display
+    for i, m in enumerate(modes):
+        row = [k for k in groups if k[0] == m]
+        for j in range(ncol):
+            ax = axes[i, j]
+            if j >= len(row):
+                ax.axis("off")
+                continue
+            g = d[(d["mode"] == m) & (d.bin == row[j][1])]
+            ax.set_yscale("log")
+            ax.set_ylim(*ylim)
+            _unity_band(ax)
+            for src in sorted(g.source_ctau_cm.unique()):
+                s = g[np.isclose(g.source_ctau_cm, src)].sort_values("target_ctau_cm")
+                st = _src_style(src)
+                x, y = s.target_ctau_cm.to_numpy(), s.sf.to_numpy()
+                ok = np.isfinite(y) & (s.display_class != "undefined").to_numpy() & (y >= ylim[0]) & (y <= ylim[1])
+                low = (s.display_class == "low_stats").to_numpy()
+                for a in range(len(s) - 1):  # guide line within ONE generated sample; dotted into low-stats points
+                    if ok[a] and ok[a + 1]:
+                        ax.plot(x[a:a + 2], y[a:a + 2], color=st["color"], lw=1.1, alpha=0.55, zorder=2,
+                                ls=":" if (low[a] or low[a + 1]) else "-")
+                dr = np.isclose(s.target_ctau_cm.to_numpy(), s.source_ctau_cm.to_numpy())
+                for msk, star in ((~dr, False), (dr, True)):
+                    c = draw_sr_points(ax, x[msk], s[msk], st["color"], st["marker"], ylim, ms=9.5, star=star, log=True)
+                    counts = {kk: counts[kk] + c[kk] for kk in counts}
+            _logx(ax, targets)
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+            ax.yaxis.set_minor_formatter(NullFormatter())
+            ax.set_yticks([v for v in (0.2, 0.3, 0.5, 0.7, 1, 1.5, 2, 3, 5, 7, 10) if ylim[0] <= v <= ylim[1]])
+            ax.tick_params(labelsize=15)
+            ax.set_title(disp[(m, row[j][1])], fontsize=18, pad=8)
+            if i == len(modes) - 1:
+                ax.set_xlabel(r"target c$\tau$ [cm]", fontsize=17)
+            if j == 0:
+                ax.set_ylabel(r"$\mathrm{SF}_{\mathrm{SR}}$", fontsize=19)
+        pos = axes[i, 0].get_position()
+        nh = int(d[d["mode"] == m].n_hyp_total.iloc[0])
+        regime = [r for r, mm in regimes.mode_of.items() if mm == m][0]
+        fig.text(0.03, (pos.y0 + pos.y1) / 2, f"{MODE_TITLE[m]} analysis\n({nh} {REGIME_PUBLIC[regime]} hyp.)",
+                 rotation=90, ha="center", va="center", fontsize=17, fontweight="bold", linespacing=1.4)
+    _fig_cms(fig, rlabel, y=0.935, x0=0.1, x1=0.97)
+    fig.text(0.1, 0.92, r"High-$S_{xy}$ signal regions, channel-integrated; ratio of summed yields over each "
+             "analysis mode's mass hypotheses. Statistical uncertainties only; no fit.\n"
+             "Points reweighted from the same generated sample are correlated (same events); "
+             "the two generated samples are independent.", fontsize=13, ha="left", va="top")
+    h = []
+    for src in sorted(d.source_ctau_cm.unique()):
+        st = _src_style(src)
+        h.append(Line2D([], [], color=st["color"], marker=st["marker"], ms=8, lw=1.1,
+                        label=rf"reweighted from generated {src:g} cm"))
+        h.append(Line2D([], [], color=st["color"], ls="none", marker="*", ms=17, mec="black", mew=1.1,
+                        label=rf"direct MC, generated c$\tau$ = {src:g} cm"))
+    h.append(Line2D([], [], color="0.6", alpha=0.5, lw=8, label=rf"$\pm${BAND_FRAC:.0%} reference tolerance (not a fitted uncertainty)"))
+    h += sr_class_handles(counts, q=scan.quality)
+    if counts["clipped"]:
+        h.append(Line2D([], [], marker="^", color="0.3", mfc="white", ls="none",
+                        ms=9, label="outside y range (value $\\pm$ stat. printed)"))
+    fig.legend(handles=h, loc="lower center", bbox_to_anchor=(0.535, 0.0), ncol=2, frameon=False, fontsize=13.5)
+    return _save(fig, out, stem)
+
+
 def all_figures(T: dict, pts: pd.DataFrame, regimes, scan, out: Path, rlabel: str) -> list[Path]:
     made = []
     q = scan.quality
@@ -336,6 +417,9 @@ def all_figures(T: dict, pts: pd.DataFrame, regimes, scan, out: Path, rlabel: st
         made += sf_vs_ctau_grid(g, out / "per_hypothesis", f"sf_vs_ctau_{mk}", rlabel,
                                 f"gogoGZ ({r.mgl}, {r.mn2}, {r.mn1}) GeV, $\\Delta m$ = {r.dm} GeV "
                                 f"({REGIME_PUBLIC[regime]}); its own regime's analysis mode is the nominal one", q)
+    if (T["lifetime_sf_channel_pooled_regime"].role == "channel_sr").any():
+        made += sf_sr_regions_vs_ctau(T["lifetime_sf_channel_pooled_regime"], regimes, scan, out, "sf_sr_regions_vs_ctau",
+                                      rlabel)
     for regime, mode in regimes.mode_of.items():
         made += heatmap_lifetime(sfc, pts, out, f"sf_heatmap_ctau_{mode}", rlabel, mode, regime)
     made += validity_plot(sfc, pts, regimes, q, out, "reweight_validity_channels", rlabel)

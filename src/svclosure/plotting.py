@@ -528,6 +528,235 @@ def pool_label(pool: str) -> str:
     return pool
 
 
+# ----------------------------------------------------------------------------- SR closure summary figures
+#
+# Signal predictions are the only use of the FullSim/FastSim correction (the CRs are data driven), so these two
+# summary figures show ONLY the channel-integrated high-S_xy SR rows (role == "channel_sr"): no anchor/CR bin,
+# no low-S_xy region, no whole-channel row (those mix SR and anchor bins), no high/low double ratio.
+
+# The six mode-specific SR groups, in display order.  The two "SV + delayed photon" groups are different
+# analysis regions of different modes and are both kept.
+SR_SUMMARY_GROUPS = (
+    ("compressed", "SVonly_SR:SR"),
+    ("compressed", "MixPrompt_SR:SR"),
+    ("compressed", "MixDel_SR:SR"),
+    ("noncompressed", "Ch2SRGeLep1:SR"),
+    ("noncompressed", "Ch4SRGeHad1:SR"),
+    ("noncompressed", "Ch14SRgeq1SVHighDxygeq1PhoNotBHLate:SR"),
+)
+# A pooled yield can be precise while most of its constituent hypotheses are not individually reliable;
+# such points are drawn half-filled.
+HYP_PARTIAL_FRAC = 0.5
+SR_SF_LABEL = r"$\mathrm{SF}_{\mathrm{SR}} = Y^{\mathrm{SR}}_{\mathrm{FullSim}}\,/\,Y^{\mathrm{SR}}_{\mathrm{FastSim,corr}}$"
+SOURCE_COLOR = {10.0: "#3f90da", 50.0: "#bd1f01"}
+SOURCE_MARKER = {10.0: "o", 50.0: "D"}
+
+
+def sr_display_class(d: pd.DataFrame) -> np.ndarray:
+    """reliable | reliable_partial | low_stats | undefined.
+
+    ``sf_class`` is kept unchanged; ``reliable_partial`` marks a reliable pooled yield whose constituent
+    hypotheses are individually reliable for at most HYP_PARTIAL_FRAC of them (``frac_hyp_reliable``)."""
+    cls = d.sf_class.to_numpy(dtype=object).copy()
+    if "frac_hyp_reliable" in d:
+        frac = d.frac_hyp_reliable.to_numpy(dtype=float)
+        cls[(cls == "reliable") & np.isfinite(frac) & (frac <= HYP_PARTIAL_FRAC)] = "reliable_partial"
+    return cls
+
+
+def sr_summary_rows(t: pd.DataFrame, regimes, hlt: str = "parity", targets: dict | None = None,
+                    expected=SR_SUMMARY_GROUPS) -> pd.DataFrame:
+    """Channel-integrated high-S_xy SR rows of a regime-pooled table, each mode pooled over its OWN regime.
+
+    For lifetime tables only ``target_role`` direct / nominal rows are kept (cross-check and stress-test targets
+    are excluded), and every (source, target) pair is checked against ``targets`` (source -> nominal targets).
+    Raises if the represented groups are not exactly ``expected`` or a pool does not match its source lifetime.
+    Values are copied, never recomputed; ``display_class`` is added.
+    """
+    d = t[(t.role == "channel_sr") & (t.sxy == "high") & (t.hlt == hlt)]
+    d = pd.concat([d[(d["mode"] == m) & d.pool.str.startswith(r + "_ct")] for r, m in regimes.mode_of.items()])
+    if "target_role" in d.columns:
+        d = d[d.target_role.isin(["direct", "nominal"])]
+    got = set(zip(d["mode"], d.bin))
+    if expected is not None and got != set(expected):
+        raise ValueError(f"SR summary: expected groups {sorted(expected)}, table has {sorted(got)}")
+    pool_ct = d.pool.str.rsplit("_ct", n=1).str[1].astype(float)
+    if not np.allclose(pool_ct, d.source_ctau_cm):
+        raise ValueError("SR summary: pool lifetime does not match source_ctau_cm")
+    if "target_ctau_cm" in d.columns:
+        direct = np.isclose(d.target_ctau_cm, d.source_ctau_cm)
+        if not ((d.target_role == "direct") == direct).all():
+            raise ValueError("SR summary: target_role 'direct' must coincide with target == source lifetime")
+        if targets is not None:
+            allowed = {float(s): [float(x) for x in v] for s, v in targets.items()}
+            bad = [(s, tg) for s, tg, dr in zip(d.source_ctau_cm, d.target_ctau_cm, direct) if not dr
+                   and not any(np.isclose(tg, x) for x in allowed.get(float(s), []))]
+            if bad:
+                raise ValueError(f"SR summary: (source, target) not among the configured nominal targets: {bad}")
+    order = {k: i for i, k in enumerate(expected or sorted(got))}
+    d = d.assign(_o=[order[k] for k in zip(d["mode"], d.bin)])
+    sort = ["_o", "source_ctau_cm"] + (["target_ctau_cm"] if "target_ctau_cm" in d.columns else [])
+    d = d.sort_values(sort).drop(columns="_o").reset_index(drop=True)
+    return d.assign(display_class=sr_display_class(d))
+
+
+def sr_ylim(sf, err, cls, log: bool = False, cap: float = 1.5, pad: float = 0.08) -> tuple[float, float]:
+    """Range containing every reliable point with its full error bar, the +-10% band, and every
+    low-statistics point (with its error bar) whose central value lies within ``cap`` x the reliable span
+    (linear: around 1; log: as a factor).  Points outside are drawn as labelled arrows."""
+    sf, err, cls = np.asarray(sf, float), np.asarray(err, float), np.asarray(cls)
+    e = np.where(np.isfinite(err), err, 0)
+    fin = np.isfinite(sf) & (cls != "undefined")
+    rel = fin & np.isin(cls, ["reliable", "reliable_partial"])
+    lo = min([1 - BAND_FRAC] + list(sf[rel] - e[rel]))
+    hi = max([1 + BAND_FRAC] + list(sf[rel] + e[rel]))
+    if log:
+        lo = lo if lo > 0 else np.min(sf[rel & (sf > 0)], initial=1 - BAND_FRAC) / 1.5
+        llo, lhi = np.log(lo), np.log(hi)
+        low = fin & (cls == "low_stats") & (sf > 0) & (np.log(np.where(sf > 0, sf, 1)) >= cap * llo) \
+            & (np.log(np.where(sf > 0, sf, 1)) <= cap * lhi)
+        if low.any():
+            lw = sf[low] - e[low]
+            llo = min(llo, np.log(np.min(np.where(lw > 0, lw, sf[low] / 1.5))))
+            lhi = max(lhi, np.log(np.max(sf[low] + e[low])))
+        w = lhi - llo
+        return float(np.exp(llo - pad * w)), float(np.exp(lhi + pad * w))
+    span = max(hi - 1, 1 - lo)
+    low = fin & (cls == "low_stats") & (sf >= 1 - cap * span) & (sf <= 1 + cap * span)
+    if low.any():
+        lo, hi = min(lo, np.min(sf[low] - e[low])), max(hi, np.max(sf[low] + e[low]))
+    w = hi - lo
+    return max(0.0, lo - pad * w), hi + pad * w
+
+
+def draw_sr_points(ax, x, d: pd.DataFrame, color: str, marker: str, ylim, ms: float = 10, star: bool = False,
+                   log: bool = False) -> dict:
+    """Draw SR measurements with the display-class conventions:
+    reliable filled / solid bar, reliable_partial half-filled / solid bar, low_stats open / dashed bar,
+    undefined hollow triangle at the edge.  Values outside ``ylim`` become arrows at the edge labelled with
+    the value and its uncertainty; error bars running past the axis are counted.  Returns counts."""
+    lo, hi = ylim
+    frac = (lambda f: lo * (hi / lo) ** f) if log else (lambda f: lo + f * (hi - lo))
+    n = dict(clipped=0, bar_clipped=0, undefined=0, partial=0, low_stats=0)
+    x = np.asarray(x, float)
+    kw = dict(marker="*", ms=ms * 1.9, mec="black", mew=1.1) if star else dict(marker=marker, ms=ms, mec=color, mew=1.6)
+    for xi, r in zip(x, d.itertuples(index=False)):
+        c, sf, er = r.display_class, float(r.sf), float(r.sf_err) if np.isfinite(r.sf_err) else 0.0
+        z = 6 if star else 4
+        if c == "undefined" or not np.isfinite(sf):
+            st = getattr(r, "status", "")
+            ax.plot(xi, frac(0.97 if st == "fastsim_empty" else 0.03), ls="none", color="black", mfc="none", ms=ms,
+                    marker="^" if st == "fastsim_empty" else ("x" if st == "both_empty" else "v"), zorder=z)
+            n["undefined"] += 1
+            continue
+        n["partial"] += c == "reliable_partial"
+        n["low_stats"] += c == "low_stats"
+        mfc = color if c == "reliable" else "white"
+        style = dict(kw, color=color, mfc=mfc, ls="none", zorder=z)
+        if c == "reliable_partial":
+            style.update(fillstyle="bottom", mfc=color, mfcalt="white")
+        if sf > hi or sf < lo:
+            up = sf > hi
+            ax.plot(xi, frac(0.965 if up else 0.035), **dict(style, marker="^" if up else "v", ms=ms + 1,
+                                                                mec=color, mew=1.6))
+            ax.annotate(f"{sf:.3g} $\\pm$ {er:.2g}", (xi, frac(0.965 if up else 0.035)), xytext=(7, 0),
+                        textcoords="offset points", ha="left", va="center", fontsize=13, color=color, zorder=8,
+                        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
+                        style="italic" if c == "low_stats" else "normal")
+            n["clipped"] += 1
+            continue
+        if sf + er > hi or sf - er < lo:
+            n["bar_clipped"] += 1
+        eb = ax.errorbar(xi, sf, yerr=[[min(er, sf - lo * (1.0001 if log else 1))] if log else [er], [er]],
+                         fmt="none", ecolor=color, elinewidth=2.2 if c != "low_stats" else 1.5, capsize=0, zorder=z - 1)
+        if c == "low_stats":
+            for coll in eb[2]:
+                coll.set_linestyle("--")
+        ax.plot(xi, sf, **style)
+    return n
+
+
+def sr_class_handles(counts: dict, q=None, marker: str = "o") -> list:
+    g = "0.3"
+    h = [Line2D([], [], marker=marker, ms=9, color=g, mfc=g, ls="-", lw=2, label="reliable (stat. uncertainty)")]
+    if counts.get("partial"):
+        h.append(Line2D([], [], marker=marker, ms=9, color=g, mfc=g, mfcalt="white", fillstyle="bottom", ls="-", lw=2,
+                        label=rf"reliable pool, but $\leq${HYP_PARTIAL_FRAC:.0%} of its hypotheses reliable"))
+    if counts.get("low_stats"):
+        thr = "" if q is None else (rf" ($N_{{\mathrm{{eff}}}}<{q.min_neff_reweighted:g}$ reweighted, "
+                                    rf"top-1 $w^2$ share $>{q.max_top1_sumw2_frac:g}$)")
+        h.append(Line2D([], [], marker=marker, ms=9, color=g, mfc="white", ls="--", lw=1.5,
+                        label="low statistics / concentrated weights" + thr))
+    if counts.get("undefined"):
+        h.append(Line2D([], [], marker="v", color="black", mfc="none", ls="none", label="undefined (empty sample)"))
+    return h
+
+
+def sf_sr_regions_direct(t: pd.DataFrame, regimes, out: Path, stem: str, rlabel: str, hlt: str = "parity") -> list[Path]:
+    """Figure 1: channel-integrated SR SF of the six SR groups at the directly generated lifetimes.
+
+    Input: ``sf_channel_pooled_regime.csv`` (ratio of summed yields over the mode's own regime hypotheses,
+    one pool per generated lifetime)."""
+    _style()
+    d = sr_summary_rows(t, regimes, hlt)
+    groups = list(dict.fromkeys(zip(d["mode"], d.bin)))
+    modes = [m for m in MODE_ORDER if m in set(d["mode"])]
+    gap = 0.5
+    xg = {k: i + gap * modes.index(k[0]) for i, k in enumerate(groups)}
+    srcs = sorted(d.source_ctau_cm.unique())
+    ylo, yhi = sr_ylim(d.sf, d.sf_err, d.display_class)
+    ymax = yhi + 0.17 * (yhi - ylo)  # headroom for the mode titles
+    fig, ax = plt.subplots(figsize=(12, 7.6))
+    _unity_band(ax)
+    counts = dict(clipped=0, bar_clipped=0, undefined=0, partial=0, low_stats=0)
+    for k, src in enumerate(srcs):
+        g = d[np.isclose(d.source_ctau_cm, src)]
+        xs = np.array([xg[kk] for kk in zip(g["mode"], g.bin)]) + (k - (len(srcs) - 1) / 2) * 0.24
+        c = draw_sr_points(ax, xs, g, SOURCE_COLOR.get(src, PETROFF[4]), SOURCE_MARKER.get(src, "s"), (ylo, ymax), ms=11)
+        counts = {kk: counts[kk] + c[kk] for kk in counts}
+        for xi, r in zip(xs, g.itertuples(index=False)):  # constituent-hypothesis reliability, when incomplete
+            if r.n_hyp_reliable < r.n_hyp_total:
+                ax.annotate(f"{r.n_hyp_reliable:.0f}/{r.n_hyp_total:.0f} hyp.\nreliable", (xi, r.sf - r.sf_err),
+                            xytext=(0, -6), textcoords="offset points", ha="center", va="top", fontsize=10.5,
+                            color="0.25")
+    ax.set_ylim(ylo, ymax)
+    xs_all = list(xg.values())
+    ax.set_xlim(min(xs_all) - 0.55, max(xs_all) + 0.55)
+    ax.set_xticks(xs_all)
+    disp = d.drop_duplicates(["mode", "bin"]).set_index(["mode", "bin"]).group_display
+    ax.set_xticklabels([disp[k] for k in groups], fontsize=18)
+    ax.tick_params(axis="x", which="both", top=False, bottom=False)
+    import matplotlib.transforms as mtrans
+
+    tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
+    for i, m in enumerate(modes):
+        xm = [xg[k] for k in groups if k[0] == m]
+        nh = int(d[d["mode"] == m].n_hyp_total.iloc[0])
+        regime = [r for r, mm in regimes.mode_of.items() if mm == m][0]
+        ax.text(np.mean(xm), 0.955, f"{MODE_TITLE[m]} analysis", transform=tr, ha="center", va="top", fontsize=19,
+                fontweight="bold")
+        ax.text(np.mean(xm), 0.885, f"{nh} {REGIME_PUBLIC[regime]} mass hypotheses", transform=tr, ha="center",
+                va="top", fontsize=13, color="0.25")
+        if i:
+            ax.axvline(min(xm) - (1 + gap) / 2, color="black", lw=2.5)
+    ax.set_ylabel(SR_SF_LABEL, fontsize=21)
+    _cms(ax, rlabel)
+    h = [Line2D([], [], color=SOURCE_COLOR.get(s, PETROFF[4]), marker=SOURCE_MARKER.get(s, "s"), ms=10, lw=2,
+                label=rf"generated c$\tau$ = {s:g} cm") for s in srcs]
+    h.append(Patch(color="0.6", alpha=0.25, lw=0, label=rf"$\pm${BAND_FRAC:.0%} reference tolerance (not a fitted uncertainty)"))
+    h += sr_class_handles(counts)[1:]
+    ax.legend(handles=h, loc="upper center", bbox_to_anchor=(0.5, -0.07), ncol=2 if len(h) > 3 else 3,
+              frameon=False, fontsize=13.5)
+    note = (r"High-$S_{xy}$ signal regions, channel-integrated. Each point is a ratio of summed yields over the "
+            "mass hypotheses\nof its analysis mode at one generated lifetime; per-region values, not a common SF. "
+            "Statistical uncertainties only\n(error bars hidden where smaller than the marker).")
+    if counts["clipped"] or counts["bar_clipped"]:
+        note += f"\n{counts['clipped'] + counts['bar_clipped']} value(s)/uncertainties extend beyond the y range."
+    ax.text(0.0, -0.13 - 0.055 * int(np.ceil(len(h) / (2 if len(h) > 3 else 3))), note, fontsize=12.5, ha="left",
+            va="top", transform=ax.transAxes)
+    return _save(fig, out, stem)
+
+
 # ----------------------------------------------------------------------------- the nominal figure set
 
 
@@ -574,6 +803,8 @@ def study_figures(T: dict, pts: pd.DataFrame, regimes, fig: Path, rl: str, per_p
             parts = [cr[(cr["mode"] == m) & cr.pool.str.startswith(r + "_ct")] for r, m in regimes.mode_of.items()]
             made += channel_summary(pd.concat(parts), fig, f"sf_channel_regime{sfx}", rl, hlt,
                                     "Channel-integrated, ratio of summed yields over each mode's own regime", min_neff)
+            if hlt == "parity" and (cr.role == "channel_sr").any():
+                made += sf_sr_regions_direct(cr, regimes, fig, "sf_sr_regions_direct", rl, hlt)
         hp = T.get("highlow_pooled_regime")
         if hp is not None and len(hp):
             made += highlow_plot(hp, fig, f"sf_high_vs_low_regime{sfx}", rl, hlt,
