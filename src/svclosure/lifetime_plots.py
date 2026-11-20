@@ -191,7 +191,9 @@ def heatmap_lifetime(t: pd.DataFrame, pts: pd.DataFrame, out: Path, stem: str, r
 
 def validity_plot(sfl: pd.DataFrame, pts: pd.DataFrame, regimes, q, out: Path, stem: str, rlabel: str,
                   level_label: str = "channel") -> list[Path]:
-    """N_eff(target)/N_eff(direct) and the largest single-event share of sum w^2, vs target lifetime.
+    """N_eff(target)/N_eff(direct) and the largest one-/five-event shares of sum w^2, vs target lifetime.
+
+    The channel shares are exact (top-K of the union of the channel's disjoint bins).
 
     Regime-matched hypotheses only; median over hypotheses x channels with the 10-90% range.
     """
@@ -205,21 +207,25 @@ def validity_plot(sfl: pd.DataFrame, pts: pd.DataFrame, regimes, q, out: Path, s
     ref = d[np.isclose(d.target_ctau_cm, d.source_ctau_cm)].set_index(["mode", "bin", "point"]).neff_min
     d["neff_ratio"] = d.neff_min.to_numpy() / ref.reindex(pd.MultiIndex.from_frame(d[["mode", "bin", "point"]])).to_numpy()
     d["top1"] = np.maximum(d.full_top1_sumw2_frac, d.fast_top1_sumw2_frac)
-    fig, (a1, a2, a3) = plt.subplots(3, 1, figsize=(10, 14), sharex=True)
-    fig.subplots_adjust(hspace=0.08, top=0.9)
+    d["top5"] = np.maximum(d.full_top5_sumw2_frac, d.fast_top5_sumw2_frac) if "full_top5_sumw2_frac" in d else np.nan
+    fig, (a1, a2, a3, a4) = plt.subplots(4, 1, figsize=(10, 18), sharex=True)
+    fig.subplots_adjust(hspace=0.08, top=0.92)
     targets = sorted(d.target_ctau_cm.unique())
     for (src, mode), g in d.groupby(["source_ctau_cm", "mode"]):
         st = _src_style(src)
         ls = "-" if mode == "compressed" else "--"
         agg = g.groupby("target_ctau_cm").agg(r_med=("neff_ratio", "median"), r_lo=("neff_ratio", lambda v: v.quantile(.1)),
                                               r_hi=("neff_ratio", lambda v: v.quantile(.9)), n_med=("neff_min", "median"),
-                                              t_med=("top1", "median"), t_max=("top1", "max"))
+                                              t_med=("top1", "median"), t_max=("top1", "max"),
+                                              f_med=("top5", "median"), f_max=("top5", "max"))
         lab = f"from {src:g} cm, {MODE_TITLE[mode]}"
         a1.plot(agg.index, agg.r_med, ls=ls, marker=st["marker"], color=st["color"], label=lab)
         a1.fill_between(agg.index, agg.r_lo, agg.r_hi, color=st["color"], alpha=0.12, lw=0)
         a2.plot(agg.index, agg.n_med, ls=ls, marker=st["marker"], color=st["color"])
         a3.plot(agg.index, agg.t_med, ls=ls, marker=st["marker"], color=st["color"])
         a3.plot(agg.index, agg.t_max, ls=":", marker=st["marker"], mfc="white", color=st["color"])
+        a4.plot(agg.index, agg.f_med, ls=ls, marker=st["marker"], color=st["color"])
+        a4.plot(agg.index, agg.f_max, ls=":", marker=st["marker"], mfc="white", color=st["color"])
     a1.axhline(1, color="0.4", lw=1)
     a1.set_ylabel(r"$N_{\mathrm{eff}}$(target) / $N_{\mathrm{eff}}$(direct)", fontsize=16)
     a1.legend(fontsize=11, frameon=False, ncol=2, loc="lower center")
@@ -235,10 +241,17 @@ def validity_plot(sfl: pd.DataFrame, pts: pd.DataFrame, regimes, q, out: Path, s
                        Line2D([], [], color="0.3", ls="-.", label=f"threshold ({q.max_top1_sumw2_frac:g})")],
                fontsize=11, frameon=False)
     a3.set_ylim(0, None)
-    _logx(a3, targets)
-    a3.set_xlabel(r"target c$\tau$ [cm]")
-    _fig_cms(fig, rlabel, y=0.925, x0=0.125, x1=0.9)
-    fig.text(0.125, 0.905, f"{level_label}-integrated high-$S_{{xy}}$ yields, regime-matched hypotheses "
+    a4.axhline(q.max_top5_sumw2_frac, color="0.3", ls="-.", lw=1.2)
+    a4.set_ylabel(r"five largest $w^2$ / $\sum w^2$", fontsize=16)
+    a4.legend(handles=[Line2D([], [], color="0.3", label="median"), Line2D([], [], color="0.3", ls=":", mfc="white",
+                                                                              marker="o", label="maximum"),
+                       Line2D([], [], color="0.3", ls="-.", label=f"threshold ({q.max_top5_sumw2_frac:g})")],
+               fontsize=11, frameon=False)
+    a4.set_ylim(0, 1.02)
+    _logx(a4, targets)
+    a4.set_xlabel(r"target c$\tau$ [cm]")
+    _fig_cms(fig, rlabel, y=0.94, x0=0.125, x1=0.9)
+    fig.text(0.125, 0.925, f"{level_label}-integrated high-$S_{{xy}}$ yields, regime-matched hypotheses "
              "(band: 10-90% of hypotheses x channels)", fontsize=12)
     return _save(fig, out, stem)
 

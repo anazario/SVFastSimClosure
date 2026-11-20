@@ -67,11 +67,18 @@ lifetimes with LLPCombine's event weight (`BuildFitInput::BuildReweights`):
   settings, so the factor cannot be applied twice.  The FastSim S_xy correction is not touched.
 * Selections are identical for all targets: masks are evaluated once per chunk, and all targets are
   accumulated together (sum w, sum w^2, sum w_i w_j between targets, top-k weights) in one read.
-* The target equal to the generated lifetime is the direct reference.  It is bitwise identical to the
-  unreweighted result (`lifetime_checks.json`).
-* `Xa_ctau`/`Xb_ctau` validity is recorded per event (`lifetime_anomalies.csv`): non-finite, negative,
-  zero, or != 1 `Evt_is*` flag.  `invalid_ctau_policy`: `llpcombine` (default; weight as LLPCombine does,
-  and record), `exclude`, `fail`.
+* The target equal to the generated lifetime is the direct reference.  It is always evaluated, even
+  when `--targets` omits it (`target_origin = auto_direct`), and it must be bitwise identical to the
+  unreweighted result (`lifetime_checks.json`; a mismatch fails the run).
+* Input anomalies are counted for every event (`sample_lifetime_inputs.csv`, `lifetime_checks.json`).
+  `lifetime_anomalies.csv` lists only examples, at most 2,000 per task.  The classes are:
+  `ctau_nonfinite`, `ctau_negative`, `ctau_zero`, `decay_flags_none` and `decay_flags_multiple`.
+  A zero ctau is a valid input, with weight `tau0/tau`.  `invalid_ctau_policy` takes `llpcombine`
+  (the default: weight as LLPCombine does), `exclude` or `fail`.  The full table is in `weights.py`
+  and in `run_config.json`.  Under every policy, a selected event with a non-finite weight is fatal.
+* `run_status.json` records `complete`, `partial` or `failed`.  A failed run exits nonzero and is
+  renamed `*_FAILED`; it keeps diagnostics only.  `svclosure plot --run` uses the configuration
+  saved in that run.
 * Python weights are bit-exact with the C++ header.  The ratio `tau0/tau` is computed in float and the
   exponent in double; `validate` compares every event's xawt/xbwt/evtrwt with RDataFrame.
 * Quality criteria (`lifetime_scan.quality`): `min_neff`, `min_neff_reweighted`, `max_top1_sumw2_frac`,

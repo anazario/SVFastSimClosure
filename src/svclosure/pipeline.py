@@ -20,7 +20,7 @@ from . import bins as binsmod
 from . import expr, lifetime, llpcombine, provenance
 from .samples import SignalPoint, build_pairs, inspect_points
 from .weights import WeightSpec, anomaly_names, weight_spec_from_config
-from .yields import ANOM_CLASSES, HLT_MODES, make_tasks, merge, run_task
+from .yields import ANOM_CLASSES, HLT_MODES, MAX_EVENT_RECORDS, make_tasks, merge, run_task
 
 PKG_SRC = Path(__file__).resolve().parents[1]
 
@@ -203,10 +203,11 @@ class YieldRun:
     yields: pd.DataFrame  # one row per (selection, point, sim, hlt, variant)
     cross: pd.DataFrame  # sum w_i w_j between variants (same point/sim/selection/hlt)
     overlaps: pd.DataFrame  # event-level overlaps of selection pairs (n_ab > 0 only)
-    anomalies: pd.DataFrame  # events with invalid lifetime inputs / decay flags
-    files: pd.DataFrame  # per (point, sim): lifetime-input summary
+    anomalies: pd.DataFrame  # EXAMPLES of events with anomalous inputs (<= MAX_EVENT_RECORDS per task)
+    files: pd.DataFrame  # per (point, sim): lifetime-input summary (complete counts)
     perf: dict
     merged: dict
+    failures: pd.DataFrame = None  # events that made a task fail (non-finite weight / invalid input under 'fail')
 
 
 def run_yields(study: Study, points: list[SignalPoint], bins: list[binsmod.ResolvedBin], workers: int,
@@ -276,6 +277,7 @@ def run_yields(study: Study, points: list[SignalPoint], bins: list[binsmod.Resol
                             w_max=float(top[0]) if len(top) else 0.0,
                             frac_wmax_sumw=float(top[0] / acc.sumw[s, h, v]) if acc.sumw[s, h, v] > 0 else np.nan,
                             top1_sumw2_frac=fr(1), top3_sumw2_frac=fr(3), top5_sumw2_frac=fr(min(5, K)),
+                            top_w=top.copy(),
                             **{f"n_anom_{c}": int(acc.n_anom[s, h, i]) for i, c in enumerate(ANOM_CLASSES)},
                             sumw_anom=float(acc.sumw_anom[s, h, v])))
                         for u in range(len(variants)):
@@ -297,10 +299,17 @@ def run_yields(study: Study, points: list[SignalPoint], bins: list[binsmod.Resol
         frows.append(dict(point=pk, sim=sim, path=m["path"], entries=m["entries"], source_ctau_cm=src,
                           n_ctau_valid=mom["n"], mean_Xa_ctau=mom["sum_xa"] / mom["n"] if mom["n"] else np.nan,
                           mean_Xb_ctau=mom["sum_xb"] / mom["n"] if mom["n"] else np.nan, n_excluded=m["n_excluded"],
-                          **{f"n_{k}": v for k, v in m["anomaly_totals"].items()}))
+                          **{f"n_{k}": v for k, v in m["anomaly_totals"].items()},
+                          **{f"n_in_bins_{k}": v for k, v in m["anomaly_in_bins"].items()},
+                          n_events_listed=len(m["events"]), n_tasks=m["n_tasks"],
+                          event_list_cap_per_task=MAX_EVENT_RECORDS,
+                          event_list_truncated=bool(m["n_tasks_event_list_full"])))
         for e in m["events"]:
             e = dict(e)
             ev = e.pop("evtrwt")
+            e.pop("targets_cm", None)
+            e.pop("nonfinite_targets", None)
+            e.pop("selections_all", None)
             e["anomaly"] = anomaly_names(e["code"])
             e["selections_parity"] = ";".join(e["selections_parity"])
             for v, w in enumerate(ev):
@@ -322,7 +331,17 @@ def run_yields(study: Study, points: list[SignalPoint], bins: list[binsmod.Resol
     if len(y):
         y["source_ctau_cm"] = y.point.map({p.key: (targets_of(p)[0] if targets_of else _key_ctau(p)) for p in points})
         y.loc[y.variant == "noreweight", "target_ctau_cm"] = y.loc[y.variant == "noreweight", "source_ctau_cm"]
-    return YieldRun(y, pd.DataFrame(crows), pd.DataFrame(orows), pd.DataFrame(events), pd.DataFrame(frows), perf, merged)
+    fails = []
+    for m in merged.values():
+        for e in m["failure_events"]:
+            e = dict(e)
+            e["anomaly"] = anomaly_names(e["code"])
+            e["source_ctau_cm"] = next((targets_of(p)[0] for p in points if p.key == e["point"]), None) if targets_of else None
+            for k in ("targets_cm", "evtrwt", "nonfinite_targets", "selections_parity", "selections_all"):
+                e[k] = json.dumps(e[k])
+            fails.append(e)
+    return YieldRun(y, pd.DataFrame(crows), pd.DataFrame(orows), pd.DataFrame(events), pd.DataFrame(frows), perf, merged,
+                    pd.DataFrame(fails))
 
 
 def _key_ctau(p: SignalPoint) -> float:

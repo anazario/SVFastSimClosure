@@ -51,11 +51,33 @@ the full provenance is in `provenance.json`, the complete configuration in `run_
   benchmark points
 * `reference_yields.csv` - the reference selections (envelopes, S_xy-inclusive, omissions)
 * `sample_lifetime_inputs.csv` - per file: Xa/Xb_ctau validity counts and means
-* `lifetime_anomalies.csv` - every event with invalid lifetime inputs or != 1 decay flag, with its bins/weights
+* `lifetime_anomalies.csv` - **examples**, not an exhaustive list: events with anomalous inputs (see the policy
+  table in `run_config.json` -> `lifetime_scan.invalid_input_policy_table`), with their bins, inputs and weights,
+  at most 2,000 per task (a task is <= `task_entries` entries of one file).  The complete counts over all
+  processed events are `n_<class>` (all skimmed events) and `n_in_bins_<class>` (events entering >= 1 analysis
+  bin, HLT parity) in `sample_lifetime_inputs.csv` and `lifetime_checks.json`; `event_list_truncated` says
+  whether any task reached the cap
+* `pool_members.csv` - the hypotheses entering each pool
+* Pooled SF tables (`sf_pooled*.csv`, `sf_channel_pooled_regime.csv`, `lifetime_sf*_pooled_regime.csv`) answer two
+  separate questions: `sf_class` (= `pooled_yield_class`): is the pooled ratio of sums statistically stable?
+  `n_hyp_total`, `n_hyp_reliable`, `n_hyp_low_stats`, `n_hyp_undefined`, `frac_hyp_reliable`: how many of the
+  constituent hypotheses pass the per-hypothesis criteria on their own?  A precise pool does not imply reliable
+  constituents.
+* `run_status.json` - `status` complete | partial | failed, fatal failures, required checks, omitted points.
+  A failed run directory is renamed `*_FAILED` and holds only diagnostics (`diagnostics/`), no result tables
 
 ## Lifetime scan (svclosure lifetime-scan)
 * `lifetime_yields.csv` - per (selection, point, sim, hlt, target): n_raw, sumw, sumw2, w_max,
-  frac_wmax_sumw (largest single weight / total), top{1,3,5}_sumw2_frac, anomalies
+  frac_wmax_sumw (largest single weight / total), top{1,3,5}_sumw2_frac, `top_w` (the K = quality.topk largest
+  |w|, descending, zero-padded, space-separated exact decimal), anomalies.
+  Channel and pooled concentration fractions are computed **exactly** from the constituents' `top_w`
+  (the K largest weights of a disjoint union are the K largest of the concatenated per-constituent lists);
+  `sf_class` of channel/pooled rows applies max_top1 AND max_top5 to these exact values.
+* Target lifetimes: `target_origin` = `requested` (in the target list), `auto_direct` (the generated lifetime,
+  added automatically when a list omits it: the direct reference is always evaluated) or `crosscheck`
+  (`crosscheck_targets`); `target_role` = direct | nominal | cross_check | stress_test.  `run_config.json` ->
+  `lifetime_scan` records `targets` (as requested), `auto_direct_references`, `crosscheck_targets`,
+  `evaluated_targets`; `lifetime_checks.json` -> `target_lifetimes` repeats it per generated lifetime
 * `lifetime_sf.csv`, `lifetime_sf_channel.csv` - per-hypothesis SFs per target; `status`/`sf_class` use the
   quality criteria in `run_config.json`
 * `lifetime_sf_pooled_regime.csv`, `lifetime_sf_channel_pooled_regime.csv` - regime ratio-of-sums pools per
@@ -63,13 +85,19 @@ the full provenance is in `provenance.json`, the complete configuration in `run_
 * `lifetime_cov_yields.csv` - sum_events w_i w_j between targets i, j of the same generated sample
   (per point, sim, selection, hlt).  This is Cov(Y_i, Y_j) of the weighted yields; diagonal = sumw2.
 * `lifetime_cov_logsf.csv` - Cov(ln SF_i, ln SF_j) = Cov_F/(F_i F_j) + Cov_S/(S_i S_j) and the correlation,
-  first-order; `gaussian_ok` is false when either point is not status ok.  Targets from the SAME generated
-  sample are strongly correlated: never treat them as independent measurements.
+  first-order (`level` = bin | channel).  Values are kept wherever defined (`defined`: all four yields > 0, finite
+  moments), also for low-statistics points; `gaussian_ok` additionally requires `sf_class_i` and `sf_class_j`
+  to be `reliable` (N_eff, reweighted N_eff, top-1 and top-5 concentration).  Rows never mix generated samples.
+  Targets from the SAME generated sample are strongly correlated: never treat them as independent measurements.
 * `lifetime_highlow.csv` - high/low double ratios per target
 * `lifetime_source_crosscheck.csv`, `lifetime_source_crosscheck_channel.csv` - direct MC at T vs the other
   generated sample reweighted to T (`role = cross_check` for 50->10 cm, `stress_test` for 10->50 cm), z-scores
-* `lifetime_quality.csv` - per (generated lifetime, target): reliability fractions, N_eff ratios, verdict
-* `lifetime_checks.json` - direct-target == no-reweight identity, anomaly totals, source-lifetime checks
+* `lifetime_quality.csv` - per (generated lifetime, target): reliability fractions, N_eff ratios, top-1 and
+  top-5 concentration (`median_top5`, `max_top5`, `n_top5_over` = cells above max_top5), verdict
+* `lifetime_checks.json` - required invariants: direct-target == no-reweight identity (bitwise, every row
+  present once), covariance consistency (diagonal = ln_sf_err^2, symmetry, |corr| <= 1, complete target
+  matrices, no gaussian_ok with a non-reliable input; relative tolerance `rtol`), anomaly totals,
+  source-lifetime checks, evaluated target lifetimes
 """
 
 
@@ -92,14 +120,23 @@ def build(study, yr, bins, refs, points, pts_frame: pd.DataFrame, quality, prov_
     T["reference_yields"] = y0[y0.kind != "bin"].reset_index(drop=True)
     sf = stats.sf_table(yb0.drop(columns=["variant", "target_ctau_cm", "source_ctau_cm"]), bmeta, quality)
     T["sf"] = annotate(sf, points, prov_cols)
-    allpool = stats.pooled(yb0[LEGACY_YIELD_COLS + ["w_max"]], usable, "all_hypotheses")
-    T["sf_pooled"] = stats.sf_table(allpool, bmeta, quality).assign(estimator="ratio_of_sums")
-    reg = stats.regime_pools(yb0[LEGACY_YIELD_COLS + ["w_max", "source_ctau_cm"]], pts_frame[pts_frame.usable], study.regimes)
-    T["sf_pooled_regime"] = stats.sf_table(reg, bmeta, quality).assign(estimator="ratio_of_sums")
+    members = {"all_hypotheses": usable}
+    members.update({lab: keys for _, _, _, lab, keys in stats.regime_pool_members(pts_frame[pts_frame.usable],
+                                                                                   study.regimes)})
+    topc = [c for c in ("w_max", stats.TOP_COL) if c in yb0.columns]
+    allpool = stats.pooled(yb0[LEGACY_YIELD_COLS + topc], usable, "all_hypotheses")
+    T["sf_pooled"] = stats.pool_constituents(stats.sf_table(allpool, bmeta, quality).assign(estimator="ratio_of_sums"),
+                                             sf, members)
+    reg = stats.regime_pools(yb0[LEGACY_YIELD_COLS + topc + ["source_ctau_cm"]], pts_frame[pts_frame.usable], study.regimes)
+    T["sf_pooled_regime"] = stats.pool_constituents(stats.sf_table(reg, bmeta, quality).assign(estimator="ratio_of_sums"),
+                                                    sf, members)
     ch = stats.channel_yields(yb0.drop(columns=["variant", "target_ctau_cm"]), bmeta)
-    T["sf_channel"] = annotate(stats.sf_table(ch.drop(columns=["source_ctau_cm"]), cmeta, quality), points, prov_cols)
+    sfch = stats.sf_table(ch.drop(columns=["source_ctau_cm"]), cmeta, quality)
+    T["sf_channel"] = annotate(sfch, points, prov_cols)
     regc = stats.regime_pools(ch, pts_frame[pts_frame.usable], study.regimes)
-    T["sf_channel_pooled_regime"] = stats.sf_table(regc, cmeta, quality).assign(estimator="ratio_of_sums")
+    T["sf_channel_pooled_regime"] = stats.pool_constituents(
+        stats.sf_table(regc, cmeta, quality).assign(estimator="ratio_of_sums"), sfch, members)
+    T["pool_members"] = pd.DataFrame([(lab, k) for lab, ks in members.items() for k in ks], columns=["pool", "point"])
 
     o0 = yr.overlaps[yr.overlaps.variant == "noreweight"] if len(yr.overlaps) else yr.overlaps
     refy = y0[y0.kind == "sxy_inclusive"]
@@ -136,34 +173,37 @@ def build(study, yr, bins, refs, points, pts_frame: pd.DataFrame, quality, prov_
 
     # ---- lifetime scan --------------------------------------------------------------------------------
     if scan is not None:
-        T.update(_lifetime_tables(y, yr, bmeta, cmeta, points, pts_frame, quality, prov_cols, scan, study))
+        T.update(_lifetime_tables(y, yr, bmeta, cmeta, points, pts_frame, quality, prov_cols, scan, study, members))
     return T
 
 
-def _lifetime_tables(y, yr, bmeta, cmeta, points, pts_frame, quality, prov_cols, scan, study) -> dict:
+def _lifetime_tables(y, yr, bmeta, cmeta, points, pts_frame, quality, prov_cols, scan, study, members) -> dict:
     T = {}
     yl = y[y.variant != "noreweight"]
     ylb = yl[yl.kind == "bin"]
     T["lifetime_yields"] = yl.reset_index(drop=True)
-    sfl = stats.sf_table(ylb[LEGACY_YIELD_COLS + ["variant", "source_ctau_cm", "target_ctau_cm", "w_max",
-                                                  "top1_sumw2_frac", "top3_sumw2_frac", "top5_sumw2_frac"]], bmeta, quality)
+    conc = ["w_max", "top1_sumw2_frac", "top3_sumw2_frac", "top5_sumw2_frac", stats.TOP_COL]
+    sfl = stats.sf_table(ylb[LEGACY_YIELD_COLS + ["variant", "source_ctau_cm", "target_ctau_cm"] + conc], bmeta, quality)
     T["lifetime_sf"] = annotate(sfl, points, prov_cols)
     chl = stats.channel_yields(ylb, bmeta)
     sfc = stats.sf_table(chl, cmeta, quality)
     T["lifetime_sf_channel"] = annotate(sfc, points, prov_cols)
     usable = pts_frame[pts_frame.usable]
-    reg = stats.regime_pools(ylb[LEGACY_YIELD_COLS + ["variant", "source_ctau_cm", "target_ctau_cm", "w_max"]], usable,
+    reg = stats.regime_pools(ylb[LEGACY_YIELD_COLS + ["variant", "source_ctau_cm", "target_ctau_cm"] + conc], usable,
                              study.regimes)
-    T["lifetime_sf_pooled_regime"] = stats.sf_table(reg, bmeta, quality).assign(estimator="ratio_of_sums")
+    T["lifetime_sf_pooled_regime"] = stats.pool_constituents(
+        stats.sf_table(reg, bmeta, quality).assign(estimator="ratio_of_sums"), sfl, members)
     regc = stats.regime_pools(chl, usable, study.regimes)
-    T["lifetime_sf_channel_pooled_regime"] = stats.sf_table(regc, cmeta, quality).assign(estimator="ratio_of_sums")
+    T["lifetime_sf_channel_pooled_regime"] = stats.pool_constituents(
+        stats.sf_table(regc, cmeta, quality).assign(estimator="ratio_of_sums"), sfc, members)
 
     cross = yr.cross[(yr.cross.variant_i != "noreweight") & (yr.cross.variant_j != "noreweight")]
     ccross = stats.channel_cross(cross, bmeta)
     cov = pd.concat([cross[cross.kind == "bin"], ccross], ignore_index=True)
     T["lifetime_cov_yields"] = annotate(cov, points, prov_cols)
-    T["lifetime_cov_logsf"] = pd.concat([stats.logsf_covariance(cross[cross.kind == "bin"], sfl),
-                                         stats.logsf_covariance(ccross, sfc)], ignore_index=True)
+    T["lifetime_cov_logsf"] = pd.concat([stats.logsf_covariance(cross[cross.kind == "bin"], sfl).assign(level="bin"),
+                                         stats.logsf_covariance(ccross, sfc).assign(level="channel")],
+                                        ignore_index=True)
     ol = yr.overlaps[yr.overlaps.variant != "noreweight"] if len(yr.overlaps) else yr.overlaps
     refy = yl[yl.kind == "sxy_inclusive"]
     keep = LEGACY_YIELD_COLS + ["variant", "source_ctau_cm", "target_ctau_cm"]
@@ -175,8 +215,19 @@ def _lifetime_tables(y, yr, bmeta, cmeta, points, pts_frame, quality, prov_cols,
         t = T[k]
         if len(t) and "target_ctau_cm" in t.columns and "source_ctau_cm" in t.columns:
             t["target_role"] = [scan.role(s_, t_) for s_, t_ in zip(t.source_ctau_cm, t.target_ctau_cm)]
+            t["target_origin"] = [scan.origin(s_, t_) for s_, t_ in zip(t.source_ctau_cm, t.target_ctau_cm)]
     T["lifetime_checks"] = lifetime_checks(y, yr, pts_frame)
+    T["lifetime_checks"]["covariance"] = stats.covariance_checks(T["lifetime_cov_logsf"])
+    T["lifetime_checks"]["target_lifetimes"] = {
+        fmt(src): dict(requested=scan.targets_for_nominal(src, requested_only=True) or [],
+                       auto_direct_reference=scan.auto_direct(src), crosscheck=scan.crosscheck_for(src),
+                       evaluated=scan.targets_for(src))
+        for src in sorted(scan.targets)}
     return T
+
+
+def fmt(v: float) -> str:
+    return f"{v:g}"
 
 
 def quality_table(sfl: pd.DataFrame, sfc: pd.DataFrame, q, pts_frame: pd.DataFrame | None = None,
@@ -199,6 +250,7 @@ def quality_table(sfl: pd.DataFrame, sfc: pd.DataFrame, q, pts_frame: pd.DataFra
         if allowed is not None:
             d = d[[(m, p) in allowed for m, p in zip(d["mode"], d.point)]]
         d["neff_min"] = np.minimum(d.full_n_eff, d.fast_n_eff)
+        d["top5_max"] = np.maximum(d.full_top5_sumw2_frac, d.fast_top5_sumw2_frac) if "full_top5_sumw2_frac" in d else np.nan
         direct = d[np.isclose(d.target_ctau_cm, d.source_ctau_cm)].set_index(["mode", "bin", "point"])
         for (src, tgt, mode), g in d.groupby(["source_ctau_cm", "target_ctau_cm", "mode"]):
             g = g.set_index(["mode", "bin", "point"])
@@ -216,7 +268,10 @@ def quality_table(sfl: pd.DataFrame, sfc: pd.DataFrame, q, pts_frame: pd.DataFra
                              median_neff_ratio=float(ratio.median()) if len(ratio) else np.nan,
                              p10_neff_ratio=float(ratio.quantile(0.1)) if len(ratio) else np.nan,
                              median_full_top1=float(gg.full_top1_sumw2_frac.median()) if "full_top1_sumw2_frac" in gg else np.nan,
-                             max_full_top1=float(gg.full_top1_sumw2_frac.max()) if "full_top1_sumw2_frac" in gg else np.nan))
+                             max_full_top1=float(gg.full_top1_sumw2_frac.max()) if "full_top1_sumw2_frac" in gg else np.nan,
+                             median_top5=float(gg.top5_max.median()) if len(gg) else np.nan,
+                             max_top5=float(gg.top5_max.max()) if len(gg) else np.nan,
+                             n_top5_over=int((gg.top5_max > q.max_top5_sumw2_frac).sum())))
     t = pd.DataFrame(rows)
     verdicts = []
     for r in t.itertuples():
@@ -245,11 +300,23 @@ def lifetime_checks(y: pd.DataFrame, yr, pts_frame: pd.DataFrame) -> dict:
     k = ["mode", "bin", "kind", "point", "sim", "hlt"]
     m = d.merge(n, on=k, suffixes=("_d", "_n"))
     exact = (m.n_raw_d == m.n_raw_n) & (m.sumw_d == m.sumw_n) & (m.sumw2_d == m.sumw2_n)
+    scanned = n[n.point.isin(set(y[y.variant != "noreweight"].point))]
     out = dict(direct_target_equals_noreweight=dict(rows=int(len(m)), bitwise_equal=int(exact.sum()),
+                                                    expected_rows=int(len(scanned)),
+                                                    duplicated_direct_rows=int(d.duplicated(k).sum()),
+                                                    passed=bool(len(m) == len(scanned) and exact.all()
+                                                                and not d.duplicated(k).any()),
                                                     max_rel_diff_sumw=float(((m.sumw_d - m.sumw_n).abs()
                                                                             / m.sumw_n.where(m.sumw_n != 0)).max())
                                                     if len(m) else None),
-               anomaly_totals=yr.files.filter(like="n_").sum(numeric_only=True).to_dict() if len(yr.files) else {},
+               anomaly_totals=yr.files.filter(regex="^n_(any|ctau|decay|excluded|in_bins|events_listed)").sum(
+                   numeric_only=True).astype(int).to_dict() if len(yr.files) else {},
+               anomaly_event_list=dict(
+                   listed=int(len(yr.anomalies)), cap_per_task=int(yr.files.event_list_cap_per_task.max())
+                   if len(yr.files) and "event_list_cap_per_task" in yr.files else None,
+                   truncated=bool(yr.files.event_list_truncated.any()) if "event_list_truncated" in yr.files else None,
+                   note="lifetime_anomalies.csv lists examples (at most cap_per_task per task); the n_* counts "
+                        "are complete over all processed events"),
                source_lifetime=pts_frame[["key", "source_ctau_fullsim_cm", "source_ctau_fastsim_cm", "source_ctau_ok",
                                           "source_ctau_problem"]].to_dict("records")
                if "source_ctau_ok" in pts_frame else [])
@@ -261,6 +328,9 @@ def write(run: Path, tables: dict, extra_json: dict | None = None) -> list[Path]
     for name, t in tables.items():
         if isinstance(t, pd.DataFrame):
             p = run / f"{name}.csv"
+            if stats.TOP_COL in t.columns:  # exact (round-trip) decimal repr of the top-K weights
+                t = t.assign(**{stats.TOP_COL: [" ".join(repr(float(x)) for x in v) if isinstance(v, np.ndarray) else v
+                                                for v in t[stats.TOP_COL]]})
             t.to_csv(p, index=False)
         else:
             p = run / f"{name}.json"

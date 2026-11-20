@@ -27,13 +27,21 @@ import numpy as np
 
 from . import expr
 from .rootio import IOStats, iterate_chunks
-from .weights import (ANOM_NEGATIVE, ANOM_NONFINITE, DECAY_BRANCHES, LIFETIME_BRANCHES, WeightSpec,
-                      lifetime_anomalies, weight_matrix)
+from .weights import ANOM_CLASSES as _ANOM
+from .weights import DECAY_BRANCHES, LIFETIME_BRANCHES, POLICY_ACTIONS, WeightSpec, lifetime_anomalies, weight_matrix
 
 HLT_MODES = ("parity", "symmetric")
-ANOM_CLASSES = ("any", "ctau_nonfinite", "ctau_negative", "ctau_zero", "decay_flags_not_one")
-INVALID_FOR_POLICY = ANOM_NONFINITE | ANOM_NEGATIVE  # what 'exclude'/'fail' act on; zero/flags are recorded only
-MAX_EVENT_RECORDS = 2000
+ANOM_CLASSES = tuple(name for name, _ in _ANOM)  # column order of the n_anom_* counters
+ANOM_MASKS = tuple(bits for _, bits in _ANOM)
+MAX_EVENT_RECORDS = 2000  # per task: cap of the anomalous-event EXAMPLES (counts are always complete)
+
+
+class NonFiniteWeightError(RuntimeError):
+    """A selected event has a non-finite weight in some variant: yields cannot be computed reliably."""
+
+
+class InvalidInputError(RuntimeError):
+    """invalid_ctau_policy=fail and a selected event has invalid weight inputs."""
 
 
 @dataclass
@@ -153,7 +161,9 @@ class TaskResult:
     trigger_any_true: int = 0
     anomaly_totals: dict[str, int] = field(default_factory=dict)  # over all skimmed events of the range
     ctau_moments: dict[str, float] = field(default_factory=dict)  # n, sum Xa, sum Xb (finite, > 0)
-    events: list[dict] = field(default_factory=list)  # anomalous events (capped)
+    events: list[dict] = field(default_factory=list)  # anomalous events (examples, capped per task)
+    anomaly_in_bins: dict[str, int] = field(default_factory=dict)  # anomalous events entering >= 1 analysis bin
+    failure_events: list[dict] = field(default_factory=list)  # events that made the task fail (capped)
     n_excluded: int = 0
     pid: int = 0
     error: str | None = None
@@ -170,7 +180,7 @@ def _accumulate(acc: MultiAcc, masks: np.ndarray, h: int, W: dict, mode_idx: dic
         return
     Ms = masks[:, sub]
     an = anom[sub]
-    an_cls = np.stack([an != 0] + [(an & b) != 0 for b in (1, 2, 4, 8)])  # matches ANOM_CLASSES
+    an_cls = np.stack([(an & b) != 0 for b in ANOM_MASKS])  # matches ANOM_CLASSES
     for mode, idx in mode_idx.items():
         Wm = np.ascontiguousarray(W[mode][:, sub])  # (V, k)
         V = Wm.shape[0]
@@ -219,7 +229,12 @@ def run_task(task: dict) -> TaskResult:
         res._compiled = compiled
         use_ctau = task.get("lifetime_branches", True)
         policy = task.get("invalid_ctau_policy", "llpcombine")
+        if policy not in POLICY_ACTIONS:
+            raise ValueError(f"unknown invalid_ctau_policy {policy!r}")
+        act = POLICY_ACTIONS[policy]
         source = task.get("source_ctau_cm")
+        if any(v is not None for v in variants) and not use_ctau:
+            raise InvalidInputError(f"lifetime targets requested but {LIFETIME_BRANCHES} are missing from {task['path']}")
         branches = needed_branches(compiled, list(wspecs.values()), lifetime=use_ctau)
         trig = [b for b in task.get("trigger_branches", []) if b not in branches]
         acc = MultiAcc(len(compiled), len(variants), int(task.get("topk", 10)))
@@ -227,6 +242,8 @@ def run_task(task: dict) -> TaskResult:
         for s, cb in enumerate(compiled):
             mode_idx.setdefault(cb.mode, []).append(s)
         tot = {c: 0 for c in ANOM_CLASSES}
+        in_bins = {c: 0 for c in ANOM_CLASSES}
+        bin_rows = np.array([s for s, cb in enumerate(compiled) if cb.kind == "bin"], dtype=int)
         mom = {"n": 0, "sum_xa": 0.0, "sum_xb": 0.0}
         entry = task["entry_start"]
         for arrays in iterate_chunks(
@@ -259,9 +276,10 @@ def run_task(task: dict) -> TaskResult:
                 mom["n"] += int(good.sum())
                 mom["sum_xa"] += float(xa[good].sum())
                 mom["sum_xb"] += float(xb[good].sum())
-            for i, c in enumerate(ANOM_CLASSES):
-                tot[c] += int(np.count_nonzero(anom != 0 if i == 0 else (anom & (1 << (i - 1))) != 0))
-            invalid = (anom & INVALID_FOR_POLICY) != 0
+            for c, bits in zip(ANOM_CLASSES, ANOM_MASKS):
+                tot[c] += int(np.count_nonzero(anom & bits))
+            excl = (anom & act["exclude"]) != 0
+            failm = (anom & act["fail"]) != 0
             ctx = expr.EvalContext(arrays=arrays, n_events=n)
             for h, hm in enumerate(HLT_MODES):
                 masks = np.zeros((len(compiled), n), dtype=bool)
@@ -274,23 +292,33 @@ def run_task(task: dict) -> TaskResult:
                         if cb.veto is not None:
                             masks[s] &= ~masks[cb.veto]
                 if h == 0 and use_ctau:  # record anomalous events with the bins they enter (before any policy)
+                    inb = masks[bin_rows].any(axis=0) if len(bin_rows) else np.zeros(n, bool)
+                    for c, bits in zip(ANOM_CLASSES, ANOM_MASKS):
+                        in_bins[c] += int(np.count_nonzero(inb & ((anom & bits) != 0)))
                     for i in np.flatnonzero(anom != 0)[: max(0, MAX_EVENT_RECORDS - len(res.events))]:
-                        res.events.append(dict(
-                            entry=int(entry + i), code=int(anom[i]),
-                            Xa_ctau=float(arrays["Xa_ctau"][i]), Xb_ctau=float(arrays["Xb_ctau"][i]),
-                            flags="".join(str(int(arrays[b][i])) for b in DECAY_BRANCHES),
-                            evtrwt=[float(W[compiled[0].mode][v, i]) for v in range(len(variants))],
-                            selections_parity=[compiled[s].name for s in np.flatnonzero(masks[:, i])
-                                               if compiled[s].kind == "bin"]))
-                if invalid.any():
-                    hit = masks[:, invalid].any(axis=0)
-                    if policy == "fail" and hit.any():
-                        raise RuntimeError(f"{int(hit.sum())} selected events with invalid Xa/Xb_ctau "
-                                           "(invalid_ctau_policy=fail)")
-                    if policy == "exclude":
-                        if h == 0:
-                            res.n_excluded += int(invalid.sum())
-                        masks[:, invalid] = False
+                        res.events.append(_event_record(arrays, i, entry, anom, W, compiled, masks, variants))
+                if failm.any():
+                    hit = failm & masks.any(axis=0)
+                    if hit.any():
+                        for i in np.flatnonzero(hit)[:MAX_EVENT_RECORDS]:
+                            res.failure_events.append(dict(_event_record(arrays, i, entry, anom, W, compiled, masks,
+                                                                         variants), reason="invalid_input", hlt=hm))
+                        raise InvalidInputError(f"{int(hit.sum())} selected events with invalid weight inputs "
+                                                f"(invalid_ctau_policy=fail), first entry {entry + int(np.flatnonzero(hit)[0])}")
+                if excl.any():
+                    if h == 0:
+                        res.n_excluded += int(excl.sum())
+                    masks[:, excl] = False
+                bad = np.zeros(n, dtype=bool)
+                for mode, idx in mode_idx.items():
+                    bad |= masks[idx].any(axis=0) & ~np.isfinite(W[mode]).all(axis=0)
+                if bad.any():
+                    for i in np.flatnonzero(bad)[:MAX_EVENT_RECORDS]:
+                        res.failure_events.append(dict(_event_record(arrays, i, entry, anom, W, compiled, masks, variants),
+                                                       reason="nonfinite_weight", hlt=hm))
+                    raise NonFiniteWeightError(
+                        f"{int(bad.sum())} selected events with non-finite weights (hlt={hm}, policy={policy}), "
+                        f"first entry {entry + int(np.flatnonzero(bad)[0])}; see failure_events")
                 _accumulate(acc, masks, h, W, mode_idx, anom, compiled)
             for k, v in ctx.out_of_range.items():
                 res.out_of_range[k] = res.out_of_range.get(k, 0) + v
@@ -298,11 +326,29 @@ def run_task(task: dict) -> TaskResult:
             res.seconds_select += time.perf_counter() - ts
         res.acc = acc
         res.anomaly_totals = tot
+        res.anomaly_in_bins = in_bins
         res.ctau_moments = mom
     except Exception as exc:
         res.error = f"{type(exc).__name__}: {exc}"
     res.seconds_total = time.perf_counter() - t0
     return res
+
+
+def _event_record(arrays, i, entry, anom, W, compiled, masks, variants) -> dict:
+    """Everything needed to understand one event's weight: inputs, the weights per variant, its selections."""
+    def g(b):
+        return float(arrays[b][i]) if b in arrays.fields else None
+
+    mode0 = compiled[0].mode
+    return dict(entry=int(entry + i), code=int(anom[i]), evtFillWgt=g("evtFillWgt"), Xa_ctau=g("Xa_ctau"),
+                Xb_ctau=g("Xb_ctau"),
+                flags="".join(str(int(arrays[b][i])) if b in arrays.fields else "?" for b in DECAY_BRANCHES),
+                targets_cm=[None if v is None else float(v) for v in variants],
+                evtrwt=[float(W[mode0][v, i]) for v in range(len(variants))],
+                nonfinite_targets=[None if variants[v] is None else float(variants[v]) for v in range(len(variants))
+                                   if not np.isfinite(W[mode0][v, i])],
+                selections_parity=[compiled[s].name for s in np.flatnonzero(masks[:, i]) if compiled[s].kind == "bin"],
+                selections_all=[f"{compiled[s].mode}:{compiled[s].name}" for s in np.flatnonzero(masks[:, i])])
 
 
 def make_tasks(point_key: str, sim: str, path: str, n_entries: int, task_entries: int, common: dict) -> list[dict]:
@@ -326,7 +372,9 @@ def merge(results: list[TaskResult]) -> dict:
             dict(acc=None, compiled=r._compiled, variants=r.variants, path=r.path, io=IOStats(), seconds_total=0.0,
                  seconds_select=0.0, out_of_range={}, n_zero_weight=0, sum_evtFillWgt=0.0, trigger_any_true=0,
                  errors=[], entries=0, anomaly_totals={c: 0 for c in ANOM_CLASSES},
-                 ctau_moments={"n": 0, "sum_xa": 0.0, "sum_xb": 0.0}, events=[], n_excluded=0),
+                 ctau_moments={"n": 0, "sum_xa": 0.0, "sum_xb": 0.0}, events=[], n_excluded=0,
+                 anomaly_in_bins={c: 0 for c in ANOM_CLASSES}, failure_events=[], n_tasks=0,
+                 n_tasks_event_list_full=0),
         )
         if r.acc is not None:
             if m["acc"] is None:
@@ -346,6 +394,11 @@ def merge(results: list[TaskResult]) -> dict:
         m["n_excluded"] += r.n_excluded
         for k, v in r.anomaly_totals.items():
             m["anomaly_totals"][k] += v
+        for k, v in r.anomaly_in_bins.items():
+            m["anomaly_in_bins"][k] += v
+        m["n_tasks"] += 1
+        m["n_tasks_event_list_full"] += int(len(r.events) >= MAX_EVENT_RECORDS)
+        m["failure_events"] += [dict(e, point=r.point, sim=r.sim, path=r.path) for e in r.failure_events]
         for k, v in r.ctau_moments.items():
             m["ctau_moments"][k] += v
         m["events"] += [dict(e, point=r.point, sim=r.sim) for e in r.events]

@@ -7,7 +7,17 @@ Commands
                  lifetime-reweighted, element-wise weights), optional LLPCombine-JSON comparison
   run            process all matched points (generated lifetimes only) -> tables, figures
   lifetime-scan  same files, every configured target lifetime in one pass -> lifetime tables, figures
-  plot           (re)make figures from an existing run directory
+  plot           (re)make figures from an existing run directory, with the configuration saved in it
+
+Run status: every run directory gets ``run_status.json`` (status complete | partial | failed, the
+list of fatal failures and the required checks).  A failed production run keeps only diagnostics
+(provenance, manifests, perf, failure_*.csv/json, the check results), is renamed ``*_FAILED`` and
+the command exits nonzero; no result tables or figures are written.  Fatal: bin-structure
+problems, unusable/missing/unprocessed FullSim or FastSim files (``partial`` with
+--allow-missing-points), task errors incl. non-finite weights of selected events or invalid inputs
+under invalid_ctau_policy=fail, direct target != unreweighted, within-channel overlaps
+(and unexpected overlaps/omissions with overlaps.fail_on_unexpected), covariance-consistency
+failures.
 
 Examples
   svclosure run --workers 3
@@ -100,8 +110,35 @@ def cmd_show_bins(a) -> int:
     return 0
 
 
-def _process(study, points, all_points, bins, run, workers, step, task_entries, prov, scan=None):
-    """One pass over the files -> every table (written to ``run``) -> (tables, YieldRun)."""
+class RunFailed(Exception):
+    def __init__(self, code: int, failures: list[str]):
+        super().__init__("; ".join(failures))
+        self.code, self.failures = code, failures
+
+
+def _write_status(run: Path, status: str, failures: list[str] | None = None, **extra) -> None:
+    from .provenance import now
+
+    (run / "run_status.json").write_text(json.dumps(dict(status=status, updated=now(), failures=failures or [], **extra),
+                                                    indent=1, default=str))
+
+
+def _fail_run(run: Path, exc: RunFailed, **extra) -> tuple[int, Path]:
+    _write_status(run, "failed", exc.failures, exit_code=exc.code, **extra)
+    for f in exc.failures:
+        _log(f"FATAL: {f}")
+    failed = run.with_name(run.name + "_FAILED")
+    run.rename(failed)
+    _log(f"run FAILED (exit {exc.code}); diagnostics only -> {failed}")
+    return exc.code, failed
+
+
+def _process(study, points, all_points, bins, run, workers, step, task_entries, prov, scan=None, write=True):
+    """One pass over the files -> every table -> (tables, YieldRun, points frame, run_config).
+
+    With ``write=False`` nothing but perf.json is written: the caller checks the required
+    invariants first and then calls :func:`_write_package`.
+    """
     from . import bins as B
     from . import lifetime as L
     from . import outputs as O
@@ -121,15 +158,90 @@ def _process(study, points, all_points, bins, run, workers, step, task_entries, 
     pts = P.points_frame(all_points, study.regimes)
     pts.to_csv(run / "manifest" / "points.csv", index=False)
     pts = pts[pts.key.isin([p.key for p in points])]
-    rev = short_rev(prov["repos"]["SVFastSimClosure"])
-    tables = O.build(study, yr, bins, refs, points, pts, q, rev, scan=scan)
     cfg = dict(quality=q.__dict__, lifetime_scan=scan.to_dict() if scan else None,
                signal_regimes=study.raw.get("signal_regimes"), overlaps=study.raw.get("overlaps"),
-               reference_selections=[r.to_dict() for r in refs], points=[p.key for p in points],
-               hlt_modes=list(P.HLT_MODES))
+               plot=study.raw.get("plot"), reference_selections=[r.to_dict() for r in refs],
+               points=[p.key for p in points], hlt_modes=list(P.HLT_MODES))
+    errors = _task_failures(yr, points)
+    if errors:
+        _write_failure_diagnostics(run, yr, None)
+        raise RunFailed(4, errors)
+    rev = short_rev(prov["repos"]["SVFastSimClosure"])
+    try:
+        tables = O.build(study, yr, bins, refs, points, pts, q, rev, scan=scan)
+    except ValueError as exc:  # consistency guards in stats (covariance keys, duplicated cells)
+        _write_failure_diagnostics(run, yr, None)
+        raise RunFailed(5, [f"table construction: {exc}"]) from exc
+    if write:
+        _write_package(run, study, tables, cfg, yr, bins)
+    return tables, yr, pts, cfg
+
+
+def _write_package(run, study, tables, cfg, yr, bins) -> None:
+    from . import outputs as O
+
     O.write(run, tables, {"run_config": cfg})
     O.overlap_matrices(run, yr, bins, (study.raw.get("overlaps") or {}).get("benchmark_points", []))
-    return tables, yr, pts
+
+
+def _task_failures(yr, points) -> list[str]:
+    """Read/processing errors and files that produced no result: always fatal."""
+    out = []
+    for f in yr.perf["files"]:
+        for e in f["errors"]:
+            out.append(f"{f['point']} {f['sim']}: {e}")
+    done = {(f["point"], f["sim"]) for f in yr.perf["files"]}
+    for p in points:
+        for sim in ("fullsim", "fastsim"):
+            if (p.key, sim) not in done:
+                out.append(f"{p.key} {sim}: no result (file not processed: {getattr(p, sim)})")
+    return out
+
+
+def _write_failure_diagnostics(run: Path, yr, tables: dict | None) -> None:
+    """Only what explains a failure; never the result tables."""
+    d = run / "diagnostics"
+    d.mkdir(exist_ok=True)
+    if yr is not None:
+        if yr.failures is not None and len(yr.failures):
+            yr.failures.to_csv(d / "failure_events.csv", index=False)
+        if len(yr.files):
+            yr.files.to_csv(d / "sample_lifetime_inputs.csv", index=False)
+        if len(yr.anomalies):
+            yr.anomalies.to_csv(d / "lifetime_anomalies.csv", index=False)
+        (d / "task_errors.json").write_text(json.dumps(
+            [dict(point=f["point"], sim=f["sim"], errors=f["errors"]) for f in yr.perf["files"] if f["errors"]], indent=1))
+    for k in ("lifetime_checks", "overlap_summary"):
+        if tables and k in tables:
+            (d / f"{k}.json").write_text(json.dumps(tables[k], indent=1, default=str))
+    if tables and "overlap_bin_pairs" in tables:
+        tables["overlap_bin_pairs"].to_csv(d / "overlap_bin_pairs.csv", index=False)
+
+
+def _required_checks(study, tables, scan) -> tuple[list[str], dict]:
+    """The invariants a production run must satisfy (fatal when violated)."""
+    fails, checks = [], {}
+    summ = tables["overlap_summary"]
+    checks["bin_structure_overlaps"] = not summ["structural_failures"]
+    if summ["structural_failures"]:
+        fails.append(f"{len(summ['structural_failures'])} within-channel bin pairs share events (structural failure)")
+    if (study.raw.get("overlaps") or {}).get("fail_on_unexpected"):
+        bad = len(summ["unexpected_overlaps"]) + len(summ["unexpected_omissions"])
+        checks["no_unexpected_overlaps"] = not bad
+        if bad:
+            fails.append(f"{bad} unexpected overlaps/omissions with overlaps.fail_on_unexpected set")
+    if scan is not None:
+        lc = tables["lifetime_checks"]
+        d = lc["direct_target_equals_noreweight"]
+        checks["direct_target_identity"] = d["passed"]
+        if not d["passed"]:
+            fails.append(f"direct target != unreweighted: {d['bitwise_equal']}/{d['rows']} rows bitwise equal, "
+                         f"{d['expected_rows']} expected, {d['duplicated_direct_rows']} duplicated")
+        c = lc["covariance"]
+        checks["covariance_consistency"] = c["passed"]
+        if not c["passed"]:
+            fails.append("covariance consistency: " + json.dumps({k: v for k, v in c.items() if k.endswith(("fail", "bounds", "cells", "nonreliable"))}))
+    return fails, checks
 
 
 def _overlap_verdict(study, tables) -> int:
@@ -147,7 +259,8 @@ def _overlap_verdict(study, tables) -> int:
     return 0
 
 
-def _plots(study, run: Path, tables: dict, pts: pd.DataFrame, per_point: bool = True, lifetime_figs: bool = False):
+def _plots(study, run: Path, tables: dict, pts: pd.DataFrame, per_point: bool = True, lifetime_figs: bool = False,
+           scan=None):
     from . import plotting
     from . import lifetime_plots
 
@@ -158,9 +271,10 @@ def _plots(study, run: Path, tables: dict, pts: pd.DataFrame, per_point: bool = 
                                   all_hypotheses=pc.get("include_all_hypotheses_diagnostic", True),
                                   full_names=pc.get("full_bin_name_figures", False))
     if lifetime_figs and "lifetime_sf" in tables:
-        from . import lifetime as L
+        if scan is None:
+            from . import lifetime as L
 
-        scan = L.from_config(study.raw.get("lifetime_scan"))
+            scan = L.from_config(study.raw.get("lifetime_scan"))
         made += lifetime_plots.all_figures(tables, pts, study.regimes, scan, fig / "lifetime", rl)
     return made
 
@@ -221,8 +335,14 @@ def cmd_validate(a) -> int:
         if scan.targets_for(sl.cm) is None:
             _log(f"  no lifetime targets configured for {sl.cm} cm: lifetime parity skipped")
             scan = None
-    tables, yr, pts = _process(study, sel, sel, bins, run, a.workers, study.io["step_size"], study.io["task_entries"],
-                               prov, scan)
+    try:
+        tables, yr, pts, _ = _process(study, sel, sel, bins, run, a.workers, study.io["step_size"],
+                                      study.io["task_entries"], prov, scan)
+    except RunFailed as exc:
+        return _fail_run(run, exc)[0]
+    if scan is not None:
+        report["checks"]["direct_target_identity"] = tables["lifetime_checks"]["direct_target_equals_noreweight"]["passed"]
+        report["checks"]["covariance_consistency"] = tables["lifetime_checks"]["covariance"]["passed"]
     yields, perf, sf = yr.yields, yr.perf, tables["sf"]
     for f in perf["files"]:
         _log(f"  {f['sim']}: {f['entries']} entries, {f['bytes']/1e6:.1f} MB requested, read {f['read_s']:.1f}s "
@@ -311,63 +431,97 @@ def cmd_validate(a) -> int:
     report["figures"] = [str(m) for m in made]
     report["seconds"] = time.perf_counter() - t0
     (run / "validation.json").write_text(json.dumps(report, indent=1, default=str))
-    _log(f"\nchecks: {report['checks']}\n-> {run}")
-    return 0 if all(report["checks"].values()) else 5
+    ok = all(report["checks"].values())
+    _write_status(run, "complete" if ok else "failed", [k for k, v in report["checks"].items() if not v],
+                  checks=report["checks"])
+    _log(f"\nchecks: {report['checks']}\nstatus: {'complete' if ok else 'FAILED'}\n-> {run}")
+    return 0 if ok else 5
 
 
 def _scan_common(a, scan=None, tag=None) -> int:
     study = P.load_study(a.config)
     bins, problems = P.resolve_all_bins(study)
-    if problems:  # structural bin failures stop the production scan
-        for pr in problems:
-            _log(f"STRUCTURE PROBLEM: {pr}")
-        raise SystemExit("bin structure problems: refusing to run (see above)")
     points = P.discover_points(study, inspect=True)
     _report_points(points)
-    sel = _select_points(points, a.points)
-    if scan is not None:
-        from . import lifetime as L
-
-        keep = []
-        for p in sel:
-            sl = L.source_lifetime(p)
-            if not sl.ok:
-                _log(f"  SKIP {p.key}: generated lifetime check failed: {sl.problem}")
-            elif scan.targets_for(sl.cm) is None:
-                _log(f"  SKIP {p.key}: no targets configured for generated lifetime {sl.cm:g} cm")
-            else:
-                keep.append(p)
-        sel = keep
-        if not sel:
-            raise SystemExit("no points with configured source lifetimes")
-        _log("lifetime scan: " + "; ".join(f"{s:g} cm -> {scan.targets_for(s)}" for s in scan.targets)
-             + f"  (policy for invalid Xa/Xb_ctau: {scan.invalid_ctau_policy})")
     run = P.new_run_dir(Path(a.results), tag or a.tag)
+    _write_status(run, "running")
     prov = P.write_provenance(study, run, sys.argv)
     P.write_manifests(run, bins, problems, points)
-    workers = a.workers or study.io["workers"]
-    tables, yr, pts = _process(study, sel, points, bins, run, workers, a.step_size or study.io["step_size"],
-                               a.task_entries or study.io["task_entries"], prov, scan)
-    perf = yr.perf
-    _log(f"wall {perf['wall_s']:.1f}s, {perf['total_bytes']/1e9:.2f} GB requested, "
-         f"aggregate {(perf['aggregate_MBps'] or 0):.1f} MB/s with {workers} workers")
-    bad = [f for f in perf["files"] if f["errors"]]
-    for f in bad:
-        _log(f"  ERRORS {f['point']} {f['sim']}: {f['errors']}")
-    an = yr.files.filter(like="n_ctau").sum().to_dict() if len(yr.files) else {}
-    _log(f"lifetime-input anomalies (all skimmed events): {an}; events listed in lifetime_anomalies.csv: {len(yr.anomalies)}")
+    try:
+        if problems:  # structural bin failures stop the production scan
+            raise RunFailed(3, [f"bin structure: {pr}" for pr in problems])
+        omitted = []
+        if a.points in (None, "all"):
+            bad = [p for p in points if not p.usable]
+            omitted = [f"{p.key}: unusable ({', '.join(k for k in p.CRITICAL if p.checks.get(k) is not True)})"
+                       for p in bad]
+            if omitted and not a.allow_missing_points:
+                raise RunFailed(4, [f"required sample missing/unreadable: {o}" for o in omitted]
+                                + ["(use --allow-missing-points for an explicitly partial run)"])
+        sel = _select_points(points, a.points)
+        if scan is not None:
+            from . import lifetime as L
+
+            keep = []
+            for p in sel:
+                sl = L.source_lifetime(p)
+                if not sl.ok:
+                    omitted.append(f"{p.key}: generated lifetime check failed: {sl.problem}")
+                elif scan.targets_for(sl.cm) is None:
+                    _log(f"  SKIP {p.key}: no targets configured for generated lifetime {sl.cm:g} cm")
+                else:
+                    keep.append(p)
+            sel = keep
+            if not sel:
+                raise RunFailed(2, ["no points with configured source lifetimes"])
+            if any("generated lifetime check failed" in o for o in omitted) and not a.allow_missing_points:
+                raise RunFailed(4, [o for o in omitted if "generated lifetime" in o])
+            _log("lifetime scan: " + "; ".join(
+                f"{s:g} cm -> {scan.targets_for(s)}" + (" (direct reference added automatically)"
+                                                        if scan.auto_direct(s) else "") for s in scan.targets)
+                + f"  (policy for invalid inputs: {scan.invalid_ctau_policy})")
+        workers = a.workers or study.io["workers"]
+        tables, yr, pts, cfg = _process(study, sel, points, bins, run, workers, a.step_size or study.io["step_size"],
+                                        a.task_entries or study.io["task_entries"], prov, scan, write=False)
+        perf = yr.perf
+        _log(f"wall {perf['wall_s']:.1f}s, {perf['total_bytes']/1e9:.2f} GB requested, "
+             f"aggregate {(perf['aggregate_MBps'] or 0):.1f} MB/s with {workers} workers")
+        an = {k: int(v) for k, v in yr.files.filter(regex="^n_(any|ctau|decay|in_bins)").sum().items()} \
+            if len(yr.files) else {}
+        _log(f"input anomalies (complete counts over all processed events): {an}; "
+             f"example events listed in lifetime_anomalies.csv: {len(yr.anomalies)}"
+             + (" (TRUNCATED: per-task cap reached)" if len(yr.files) and yr.files.event_list_truncated.any() else ""))
+        fails, checks = _required_checks(study, tables, scan)
+        summ = tables["overlap_summary"]
+        for k in ("structural_failures", "unexpected_overlaps", "unexpected_omissions"):
+            for r in summ.get(k, []):
+                _log(f"  {k[:-1].upper()}: {r}")
+        if scan is not None:
+            chk = tables["lifetime_checks"]["direct_target_equals_noreweight"]
+            _log(f"direct target == no-reweight: {chk['bitwise_equal']}/{chk['rows']} rows bitwise identical "
+                 f"({chk['expected_rows']} expected)")
+            c = tables["lifetime_checks"]["covariance"]
+            _log(f"covariance checks: diagonal max rel dev {c['diagonal_max_rel_dev']:.1e}, symmetry "
+                 f"{c['symmetry_max_rel_dev']:.1e}, max |corr| {c['corr_max_abs']:.12f}, gaussian_ok "
+                 f"{c['gaussian_ok']}/{c['rows']} -> {'pass' if c['passed'] else 'FAIL'}")
+        if fails:
+            _write_failure_diagnostics(run, yr, tables)
+            raise RunFailed(5, fails)
+    except RunFailed as exc:
+        return _fail_run(run, exc, n_points_selected=len(locals().get("sel") or []))[0]
+    _write_package(run, study, tables, cfg, yr, bins)
     if scan is not None:
-        chk = tables["lifetime_checks"]["direct_target_equals_noreweight"]
-        _log(f"direct target == no-reweight: {chk['bitwise_equal']}/{chk['rows']} rows bitwise identical")
         q = tables["lifetime_quality"]
         for r in q[q.level == "channel"].itertuples():
             _log(f"  {r.source_ctau_cm:g} -> {r.target_ctau_cm:g} cm [{r.mode}]: {r.n_reliable}/{r.n_direct_ok} channel SFs "
                  f"reliable, median N_eff ratio {r.median_neff_ratio:.2f} -> {r.verdict}")
-    rc = _overlap_verdict(study, tables)
     if not a.no_plots:
-        _plots(study, run, tables, pts, per_point=True, lifetime_figs=scan is not None)
+        _plots(study, run, tables, pts, per_point=True, lifetime_figs=scan is not None, scan=scan)
+    status = "partial" if omitted else "complete"
+    _write_status(run, status, [], omitted_points=omitted, checks=checks, n_points=len(sel))
+    _log(f"status: {status}" + (f" ({len(omitted)} points omitted, see run_status.json)" if omitted else ""))
     _log(f"-> {run}")
-    return 1 if bad else rc
+    return 0
 
 
 def cmd_run(a) -> int:
@@ -379,7 +533,8 @@ def cmd_lifetime_scan(a) -> int:
 
     study = P.load_study(a.config)
     scan = L.from_config(study.raw.get("lifetime_scan"), a.targets, min_neff=a.min_neff,
-                         min_neff_reweighted=a.min_neff_reweighted, max_top1_sumw2_frac=a.max_top1)
+                         min_neff_reweighted=a.min_neff_reweighted, max_top1_sumw2_frac=a.max_top1,
+                         max_top5_sumw2_frac=a.max_top5)
     if a.invalid_ctau_policy:
         scan.invalid_ctau_policy = a.invalid_ctau_policy
     if a.no_crosscheck:
@@ -401,14 +556,36 @@ def _read_tables(run: Path) -> dict:
 
 
 def cmd_plot(a) -> int:
-    study = P.load_study(a.config)
+    """Figures from a run directory with the configuration SAVED in it (study_config.yaml + run_config.json):
+    target overrides, quality thresholds, plot labels and regimes are those the run used."""
+    from . import lifetime as L
+
     run = Path(a.run)
+    st = run / "run_status.json"
+    if st.exists() and json.loads(st.read_text()).get("status") not in ("complete", "partial"):
+        raise SystemExit(f"{run}: run status is {json.loads(st.read_text()).get('status')!r}; refusing to plot")
+    saved_yaml = run / "study_config.yaml"
+    if a.use_current_config or not saved_yaml.exists():
+        _log(f"using the CURRENT configuration {a.config}" + ("" if a.use_current_config else
+                                                                " (run has no saved study_config.yaml)"))
+        study = P.load_study(a.config)
+    else:
+        study = P.load_study(saved_yaml)
+    rc = json.loads((run / "run_config.json").read_text()) if (run / "run_config.json").exists() else {}
+    scan = None
+    if rc.get("lifetime_scan") and not a.use_current_config:
+        scan = L.from_dict(rc["lifetime_scan"])
+        _log(f"lifetime configuration from {run / 'run_config.json'}: targets {rc['lifetime_scan']['targets']}, "
+             f"quality {scan.quality.__dict__}")
+    if rc.get("plot") and not a.use_current_config:
+        study.raw["plot"] = rc["plot"]
     tables = _read_tables(run)
     if "sf_channel" not in tables:
         raise SystemExit(f"{run} predates the current output layout; rerun 'svclosure run' (see README: migration)")
     pts = pd.read_csv(run / "manifest" / "points.csv")
     pts = pts[pts.key.isin(tables["sf"].point.unique())]
-    for m in _plots(study, run, tables, pts, per_point=not a.no_per_point, lifetime_figs="lifetime_sf" in tables):
+    for m in _plots(study, run, tables, pts, per_point=not a.no_per_point, lifetime_figs="lifetime_sf" in tables,
+                    scan=scan):
         _log(str(m))
     return 0
 
@@ -447,6 +624,8 @@ def main(argv=None) -> int:
         s.add_argument("--task-entries", type=int)
         s.add_argument("--tag", default=tag, help=f"run-directory suffix (default {tag})")
         s.add_argument("--no-plots", action="store_true")
+        s.add_argument("--allow-missing-points", action="store_true",
+                       help="continue without unusable/unreadable samples; the run is then status 'partial'")
 
     s = sub.add_parser("run", help="process all matched points at their generated lifetimes")
     common(s, "scan")
@@ -460,6 +639,7 @@ def main(argv=None) -> int:
     s.add_argument("--min-neff", type=float, help="status low_stats below this N_eff (default from YAML)")
     s.add_argument("--min-neff-reweighted", type=float, help="N_eff needed to draw a reweighted point as trustworthy")
     s.add_argument("--max-top1", type=float, help="max single-event fraction of sum w^2 before weight_concentrated")
+    s.add_argument("--max-top5", type=float, help="max five-event fraction of sum w^2 before weight_concentrated")
     s.add_argument("--invalid-ctau-policy", choices=["llpcombine", "exclude", "fail"])
     s.add_argument("--no-crosscheck", action="store_true", help="drop lifetime_scan.crosscheck_targets (50->10, 10->50)")
     s.set_defaults(func=cmd_lifetime_scan)
@@ -467,6 +647,8 @@ def main(argv=None) -> int:
     s = sub.add_parser("plot", help="remake figures for a run directory")
     s.add_argument("--run", required=True)
     s.add_argument("--no-per-point", action="store_true")
+    s.add_argument("--use-current-config", action="store_true",
+                   help="use --config instead of the configuration saved in the run directory")
     s.set_defaults(func=cmd_plot)
 
     a = ap.parse_args(argv)

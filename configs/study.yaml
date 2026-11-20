@@ -64,10 +64,18 @@ lifetime_scan:
   crosscheck_targets:        # processed in the same pass; only for direct-vs-reweighted comparisons, never nominal
     50: [10]                 # 50 -> 10 cm vs direct 10 cm: cross-check
     10: [50]                 # 10 -> 50 cm vs direct 50 cm: stress test (weights grow with t)
-  # Events with invalid Xa_ctau/Xb_ctau (non-finite, negative, zero) or not exactly one Evt_is* flag:
-  #   llpcombine: weight them exactly as LLPCombine does, and record them (default; keeps fit parity)
-  #   exclude:    drop them from every target (changes even the direct yields; recorded)
-  #   fail:       stop if any such event enters a selection
+  # Anomalous inputs are always recorded (complete counts in sample_lifetime_inputs.csv /
+  # lifetime_checks.json; example events in lifetime_anomalies.csv).  Full table: weights.py.
+  #   ctau_nonfinite (Xa/Xb_ctau NaN/inf): lifetime weight invalid (NaN even for the direct target)
+  #   ctau_negative  (Xa/Xb_ctau < 0):     lifetime weight finite but unphysical -> invalid
+  #   ctau_zero      (Xa/Xb_ctau == 0):    VALID (w = tau0/tau); recorded only, under every policy
+  #   decay_flags_none / decay_flags_multiple (0 or > 1 Evt_is* flags): DecayReweight gives 0 / last flag
+  # Per policy, for an event inside a selection:
+  #   llpcombine: weight exactly as LLPCombine (default; fit parity).  A non-finite weight
+  #               (e.g. ctau_nonfinite) cannot be computed reliably -> the run FAILS with an event report.
+  #   exclude:    ctau_nonfinite, ctau_negative, decay_flags_* removed from every variant, incl. noreweight
+  #   fail:       the run fails if any ctau_nonfinite, ctau_negative or decay_flags_* event is selected
+  # Under every policy a selected event with a non-finite weight in any target is fatal (never summed).
   invalid_ctau_policy: llpcombine
   quality:
     min_neff: 10               # either sample below -> status low_stats (same as the unreweighted study)

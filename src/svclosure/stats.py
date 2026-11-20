@@ -19,7 +19,14 @@ Statistical conventions
   points are ``reliable`` only with N_eff >= quality.min_neff_reweighted in both samples.
   Nothing is dropped: every bin stays in the tables for count-based modelling later.
 * Pools are **ratios of summed yields** (``estimator = ratio_of_sums``) over a stated set
-  of hypotheses: a diagnostic summary, not a fitted common SF.
+  of hypotheses: a diagnostic summary, not a fitted common SF.  Two separate questions are
+  answered for every pooled row: ``sf_class`` (is the pooled weighted yield statistically
+  stable?) and ``frac_hyp_reliable`` (what fraction of the constituent hypotheses passes the
+  per-hypothesis criteria on its own?).  A precise pool does not make its constituents reliable.
+* Weight concentration of a union of disjoint event sets (the bins of one channel, or the
+  independent samples of a pool) is computed **exactly** from the constituents' top-K weights
+  (``top_w``): the K largest weights of a disjoint union are the K largest of the concatenated
+  per-constituent top-K lists.  Top-5 fractions are never added across constituents.
 """
 from __future__ import annotations
 
@@ -29,6 +36,7 @@ import pandas as pd
 LOW_NEFF = 10.0
 YIELD_COLS = ["n_raw", "sumw", "sumw2"]
 CONC_COLS = ["w_max", "top1_sumw2_frac", "top3_sumw2_frac", "top5_sumw2_frac"]
+TOP_COL = "top_w"  # per row: the K largest |w| (descending, zero-padded), K = quality.topk
 OPTIONAL_KEYS = ["pool", "regime", "estimator", "n_hypotheses", "variant", "source_ctau_cm", "target_ctau_cm"]
 
 
@@ -102,18 +110,59 @@ def _reweighted(t: pd.DataFrame) -> pd.Series:
 # ----------------------------------------------------------------------------- pooling (ratio of sums)
 
 
+def merge_top(T: np.ndarray, K: int | None = None) -> np.ndarray:
+    """K largest entries (descending, zero-padded) of the union of rows of ``T`` (n_constituents, K)."""
+    K = T.shape[-1] if K is None else K
+    v = np.sort(np.asarray(T, dtype=np.float64).ravel())[::-1][:K]
+    return np.pad(v, (0, K - len(v)))
+
+
+def concentration(g: pd.DataFrame) -> pd.DataFrame:
+    """w_max, frac_wmax_sumw and top{1,3,5}_sumw2_frac recomputed from ``top_w`` (in place)."""
+    T = np.vstack(g[TOP_COL].to_numpy()) if len(g) else np.zeros((0, 5))
+    sq = np.cumsum(np.square(T), axis=1)
+    K = T.shape[1]
+    s2, s1 = g.sumw2.to_numpy(), g.sumw.to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g["w_max"] = T[:, 0] if K else 0.0
+        g["frac_wmax_sumw"] = np.where(s1 > 0, g.w_max / s1, np.nan)
+        for k in (1, 3, 5):
+            g[f"top{k}_sumw2_frac"] = np.where(s2 > 0, sq[:, min(k, K) - 1] / s2, np.nan)
+    return g
+
+
+def sum_disjoint(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    """Sum n_raw/sumw/sumw2 per group of rows that are DISJOINT event sets; exact top-K of the union.
+
+    Valid only for disjoint constituents (bins of one channel: structural + event-level check;
+    different signal samples of a pool: independent files).  Without ``top_w`` (old runs) only the
+    largest weight can be propagated, and top3/top5 are left undefined rather than approximated.
+    """
+    gb = df.groupby(keys, sort=False, dropna=False)
+    g = gb[YIELD_COLS].sum().reset_index()
+    if TOP_COL in df.columns:
+        gid = gb.ngroup().to_numpy()
+        T = np.vstack(df[TOP_COL].to_numpy())
+        order = np.argsort(gid, kind="stable")
+        bounds = np.searchsorted(gid[order], np.arange(len(g) + 1))
+        g[TOP_COL] = [merge_top(T[order[a:b]]) for a, b in zip(bounds[:-1], bounds[1:])]
+        g = concentration(g)
+    elif "w_max" in df.columns:
+        g["w_max"] = gb["w_max"].max().to_numpy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            g["top1_sumw2_frac"] = np.where(g.sumw2 > 0, g.w_max ** 2 / g.sumw2, np.nan)
+    return g
+
+
 def pooled(yields: pd.DataFrame, points: list[str], label: str = "pooled") -> pd.DataFrame:
     """Yields summed over the given signal points: the input of a **ratio of sums**, not a fit."""
     y = yields[yields.point.isin(points)]
     keys = ["mode", "bin", "sim", "hlt"] + [k for k in ("variant", "target_ctau_cm") if k in y.columns]
     if "source_ctau_cm" in y.columns and y.source_ctau_cm.nunique(dropna=False) == 1:
         keys.append("source_ctau_cm")
-    g = y.groupby(keys, as_index=False, dropna=False)[YIELD_COLS].sum()
-    if "w_max" in y.columns:
-        wm = y.groupby(keys, as_index=False, dropna=False)["w_max"].max()
-        g = g.merge(wm, on=keys)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            g["top1_sumw2_frac"] = np.where(g.sumw2 > 0, g.w_max ** 2 / g.sumw2, np.nan)
+    if y.duplicated(keys + ["point"]).any():
+        raise ValueError(f"pool {label}: a point enters a (selection, sim, hlt, variant) cell twice")
+    g = sum_disjoint(y, keys)
     g["point"] = "pooled"
     g["estimator"] = "ratio_of_sums"
     g["pool"] = label
@@ -128,19 +177,48 @@ def regime_pools(yields: pd.DataFrame, points_meta: pd.DataFrame, regimes, by_so
     regime is ambiguous between the configured conventions are left out (recorded in the manifest).
     """
     out = []
+    for regime, mode, src, label, keys in regime_pool_members(points_meta, regimes, by_source):
+        y = yields[(yields["mode"] == mode)]
+        if src is not None and "source_ctau_cm" in y.columns:
+            y = y[np.isclose(y.source_ctau_cm.astype(float), src)]
+        p = pooled(y, keys, label)
+        p["regime"] = regime
+        out.append(p)
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+def regime_pool_members(points_meta: pd.DataFrame, regimes, by_source: bool = True) -> list[tuple]:
+    """[(regime, mode, source cm or None, pool label, [point keys])] of the regime pools."""
+    out = []
     pm = points_meta[points_meta.regime_unambiguous]
     for regime, mode in regimes.mode_of.items():
         sel = pm[pm.regime == regime]
         groups = sel.groupby("ctau_cm_num") if by_source else [(None, sel)]
         for src, g in groups:
-            y = yields[(yields["mode"] == mode)]
-            if src is not None and "source_ctau_cm" in y.columns:
-                y = y[np.isclose(y.source_ctau_cm.astype(float), src)]
-            label = f"{regime}_ct{src:g}" if src is not None else regime
-            p = pooled(y, list(g.key), label)
-            p["regime"] = regime
-            out.append(p)
-    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+            out.append((regime, mode, src, f"{regime}_ct{src:g}" if src is not None else regime, list(g.key)))
+    return out
+
+
+def pool_constituents(pool_sf: pd.DataFrame, point_sf: pd.DataFrame, members: dict[str, list[str]]) -> pd.DataFrame:
+    """Append, per pooled row, how many of its constituent hypotheses are individually reliable.
+
+    ``sf_class`` of the pooled row answers "is the pooled yield statistically stable?";
+    ``frac_hyp_reliable`` answers "which fraction of the hypotheses entering it passes the
+    per-hypothesis criteria?".  Both are reported; neither discards the pooled estimator.
+    """
+    if not len(pool_sf):
+        return pool_sf
+    keys = ["mode", "bin", "hlt"] + [k for k in ("variant",) if k in pool_sf.columns and k in point_sf.columns]
+    mem = pd.DataFrame([(lab, p) for lab, pts in members.items() for p in pts], columns=["pool", "point"])
+    d = point_sf[keys + ["point", "sf_class"]].merge(mem, on="point")
+    agg = d.assign(r=d.sf_class == "reliable", lo=d.sf_class == "low_stats", u=d.sf_class == "undefined") \
+        .groupby(keys + ["pool"], as_index=False).agg(n_hyp_total=("point", "size"), n_hyp_reliable=("r", "sum"),
+                                                       n_hyp_low_stats=("lo", "sum"), n_hyp_undefined=("u", "sum"))
+    t = pool_sf.drop(columns=[c for c in agg.columns if c not in keys + ["pool"] and c in pool_sf.columns])
+    t = t.merge(agg, on=keys + ["pool"], how="left")
+    t["frac_hyp_reliable"] = t.n_hyp_reliable / t.n_hyp_total
+    t["pooled_yield_class"] = t.sf_class  # = question 1, kept explicit next to the constituent fraction
+    return t
 
 
 # ----------------------------------------------------------------------------- channel integration
@@ -179,13 +257,11 @@ def channel_yields(yields: pd.DataFrame, bin_meta: pd.DataFrame) -> pd.DataFrame
     meta = bin_meta[["mode", "name", "group", "role"]].rename(columns={"name": "bin"})
     y = y.merge(meta, on=["mode", "bin"], how="inner")
     keys = ["mode", "group", "point", "sim", "hlt"] + [k for k in OPTIONAL_KEYS if k in y.columns]
+    if y.duplicated(keys + ["bin"]).any():
+        raise ValueError("channel_yields: a bin enters a channel cell twice")
     out = []
     for subset, sel in (("all", y), ("sr", y[y.role == "sr"])):
-        g = sel.groupby(keys, as_index=False, dropna=False)[YIELD_COLS].sum()
-        if "w_max" in sel.columns:
-            g = g.merge(sel.groupby(keys, as_index=False, dropna=False)["w_max"].max(), on=keys)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                g["top1_sumw2_frac"] = np.where(g.sumw2 > 0, g.w_max ** 2 / g.sumw2, np.nan)
+        g = sum_disjoint(sel, keys)
         g["bin"] = g.group if subset == "all" else g.group + ":SR"
         out.append(g.drop(columns="group"))
     return pd.concat(out, ignore_index=True)
@@ -213,33 +289,100 @@ def logsf_covariance(cross: pd.DataFrame, sf: pd.DataFrame) -> pd.DataFrame:
 
     Cov(Y_i, Y_j) = sum_events w_i w_j   (same events, different weights; per sample)
     Cov(ln SF_i, ln SF_j) ~= Cov_F(i,j)/(F_i F_j) + Cov_S(i,j)/(S_i S_j)   (FullSim, FastSim independent)
-    First-order (Gaussian) approximation: ``gaussian_ok`` only when both points have status ok.
+
+    The value is kept wherever it is mathematically defined (all four yields > 0, finite moments),
+    also for low-statistics points.  ``gaussian_ok`` (first-order approximation usable) additionally
+    requires BOTH measurements to be ``sf_class == reliable`` under the run's quality criteria
+    (N_eff, reweighted N_eff, top-1/top-5 weight concentration).
+    Rows are keyed by the generated sample (``point``); rows of different points, pooled rows or
+    mismatched source lifetimes are rejected rather than combined.
     """
     if cross is None or not len(cross):
         return pd.DataFrame()
-    c = cross[cross.variant_i != "noreweight"]
-    c = c[c.variant_j != "noreweight"]
+    if (cross.point == "pooled").any():
+        raise ValueError("logsf_covariance: cross moments of pooled rows are not per-sample covariances")
+    c = cross[(cross.variant_i != "noreweight") & (cross.variant_j != "noreweight")]
     k = ["mode", "bin", "point", "hlt"]
-    piv = c.pivot_table(index=k + ["variant_i", "variant_j", "target_i_cm", "target_j_cm"], columns="sim",
-                        values="sumw_ij", aggfunc="first").reset_index()
+    idx = k + ["variant_i", "variant_j", "target_i_cm", "target_j_cm"]
+    if c.duplicated(idx + ["sim"]).any():
+        raise ValueError("logsf_covariance: duplicate cross-moment rows (would silently pick one)")
+    piv = c.pivot_table(index=idx, columns="sim", values="sumw_ij", aggfunc="first").reset_index()
     piv = piv.rename(columns={"fullsim": "cov_full", "fastsim": "cov_fast"})
-    s = sf[sf.variant != "noreweight"][k + ["variant", "full_sumw", "fast_sumw", "full_sumw2", "fast_sumw2", "status",
-                                             "source_ctau_cm"]]
-    a = s.rename(columns={c_: c_ + "_i" for c_ in ["variant", "full_sumw", "fast_sumw", "full_sumw2", "fast_sumw2", "status"]})
-    b = s.drop(columns="source_ctau_cm").rename(
-        columns={c_: c_ + "_j" for c_ in ["variant", "full_sumw", "fast_sumw", "full_sumw2", "fast_sumw2", "status"]})
+    for col in ("cov_full", "cov_fast"):
+        if col not in piv.columns:
+            piv[col] = np.nan
+    s = sf[sf.variant != "noreweight"]
+    if (s.point == "pooled").any() or s.duplicated(k + ["variant"]).any():
+        raise ValueError("logsf_covariance: SF table must hold one row per (selection, point, hlt, variant)")
+    per = ["variant", "target_ctau_cm", "full_sumw", "fast_sumw", "full_sumw2", "fast_sumw2", "status", "sf_class",
+           "ln_sf_err", "source_ctau_cm"]
+    s = s[k + per]
+    a = s.rename(columns={c_: c_ + "_i" for c_ in per})
+    b = s.rename(columns={c_: c_ + "_j" for c_ in per})
     t = piv.merge(a, on=k + ["variant_i"]).merge(b, on=k + ["variant_j"])
+    bad_src = ~np.isclose(t.source_ctau_cm_i.astype(float), t.source_ctau_cm_j.astype(float))
+    bad_tgt = ~(np.isclose(t.target_i_cm.astype(float), t.target_ctau_cm_i.astype(float))
+                & np.isclose(t.target_j_cm.astype(float), t.target_ctau_cm_j.astype(float)))
+    if bad_src.any() or bad_tgt.any():
+        raise ValueError(f"logsf_covariance: {int(bad_src.sum())} rows mix generated samples, "
+                         f"{int(bad_tgt.sum())} rows have inconsistent target lifetimes")
+    t["source_ctau_cm"] = t.source_ctau_cm_i
+    F_i, F_j, S_i, S_j = t.full_sumw_i, t.full_sumw_j, t.fast_sumw_i, t.fast_sumw_j
+    pos = (F_i > 0) & (F_j > 0) & (S_i > 0) & (S_j > 0)
     with np.errstate(divide="ignore", invalid="ignore"):
-        t["corr_full"] = t.cov_full / np.sqrt(t.full_sumw2_i * t.full_sumw2_j)
-        t["corr_fast"] = t.cov_fast / np.sqrt(t.fast_sumw2_i * t.fast_sumw2_j)
-        t["cov_ln_sf"] = t.cov_full / (t.full_sumw_i * t.full_sumw_j) + t.cov_fast / (t.fast_sumw_i * t.fast_sumw_j)
-        vi = t.full_sumw2_i / t.full_sumw_i ** 2 + t.fast_sumw2_i / t.fast_sumw_i ** 2
-        vj = t.full_sumw2_j / t.full_sumw_j ** 2 + t.fast_sumw2_j / t.fast_sumw_j ** 2
-        t["corr_ln_sf"] = t.cov_ln_sf / np.sqrt(vi * vj)
-    t["gaussian_ok"] = (t.status_i == "ok") & (t.status_j == "ok")
+        t["corr_full"] = np.where((t.full_sumw2_i > 0) & (t.full_sumw2_j > 0),
+                                  t.cov_full / np.sqrt(t.full_sumw2_i * t.full_sumw2_j), np.nan)
+        t["corr_fast"] = np.where((t.fast_sumw2_i > 0) & (t.fast_sumw2_j > 0),
+                                  t.cov_fast / np.sqrt(t.fast_sumw2_i * t.fast_sumw2_j), np.nan)
+        cov = t.cov_full / (F_i * F_j) + t.cov_fast / (S_i * S_j)
+        vi = t.full_sumw2_i / F_i ** 2 + t.fast_sumw2_i / S_i ** 2
+        vj = t.full_sumw2_j / F_j ** 2 + t.fast_sumw2_j / S_j ** 2
+        t["cov_ln_sf"] = np.where(pos, cov, np.nan)
+        t["corr_ln_sf"] = np.where(pos & (vi > 0) & (vj > 0), cov / np.sqrt(vi * vj), np.nan)
+    t["defined"] = pos & np.isfinite(t.cov_full) & np.isfinite(t.cov_fast) & np.isfinite(t.cov_ln_sf)
+    t["gaussian_ok"] = t.defined & (t.sf_class_i == "reliable") & (t.sf_class_j == "reliable")
     cols = k + ["source_ctau_cm", "target_i_cm", "target_j_cm", "variant_i", "variant_j", "cov_full", "cov_fast",
-                "corr_full", "corr_fast", "cov_ln_sf", "corr_ln_sf", "status_i", "status_j", "gaussian_ok"]
+                "corr_full", "corr_fast", "cov_ln_sf", "corr_ln_sf", "ln_sf_err_i", "ln_sf_err_j", "status_i",
+                "status_j", "sf_class_i", "sf_class_j", "defined", "gaussian_ok"]
     return t[cols].sort_values(k + ["target_i_cm", "target_j_cm"]).reset_index(drop=True)
+
+
+# Tolerances of the covariance consistency checks.  The diagonal sum_w w comes from the per-chunk
+# matrix product sel @ sel.T while sumw2 comes from sum(sel**2): identical terms, different
+# summation order, so they agree to ~1e-15 relative per chunk and ~n_chunks * 1e-16 overall.
+# 1e-9 is ~10^5 above that and ~10^6 below any real bookkeeping error (a missing/duplicated event
+# changes sum w^2 by >= 1/N_raw).
+COV_RTOL = 1e-9
+
+
+def covariance_checks(cov: pd.DataFrame, rtol: float = COV_RTOL) -> dict:
+    """Internal consistency of lifetime_cov_logsf (required invariants; see COV_RTOL)."""
+    if cov is None or not len(cov):
+        return dict(passed=True, rows=0)
+    d = cov[cov.defined]
+    diag = d[d.variant_i == d.variant_j]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dev = np.abs(diag.cov_ln_sf - diag.ln_sf_err_i ** 2) / diag.ln_sf_err_i ** 2
+    k = ["mode", "bin", "point", "hlt"]
+    m = d.merge(d, left_on=k + ["variant_i", "variant_j"], right_on=k + ["variant_j", "variant_i"], suffixes=("", "_t"))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        asym = np.abs(m.cov_ln_sf - m.cov_ln_sf_t) / np.sqrt(np.abs(m.cov_ln_sf * m.cov_ln_sf_t)).where(m.cov_ln_sf != 0, 1)
+    corr = pd.concat([d.corr_ln_sf, cov.corr_full, cov.corr_fast]).dropna()
+    over = (corr.abs() > 1 + rtol)
+    n_var = cov.groupby(k).variant_i.nunique()
+    n_rows = cov.groupby(k).size()
+    incomplete = int((n_rows != n_var ** 2).sum())
+    out = dict(rtol=rtol, rows=int(len(cov)), defined=int(len(d)), gaussian_ok=int(cov.gaussian_ok.sum()),
+               diagonal_rows=int(len(diag)), diagonal_max_rel_dev=float(dev.max()) if len(dev) else 0.0,
+               diagonal_fail=int((dev > rtol).sum()), symmetric_pairs=int(len(m)),
+               symmetry_max_rel_dev=float(asym.max()) if len(asym) else 0.0, symmetry_fail=int((asym > rtol).sum()),
+               corr_max_abs=float(corr.abs().max()) if len(corr) else 0.0, corr_out_of_bounds=int(over.sum()),
+               incomplete_cells=incomplete,
+               gaussian_ok_with_nonreliable=int((cov.gaussian_ok & ((cov.sf_class_i != "reliable")
+                                                                    | (cov.sf_class_j != "reliable"))).sum()))
+    out["passed"] = not (out["diagonal_fail"] or out["symmetry_fail"] or out["corr_out_of_bounds"] or incomplete
+                         or out["gaussian_ok_with_nonreliable"])
+    return out
 
 
 # ----------------------------------------------------------------------------- high / low S_xy

@@ -8,7 +8,12 @@ Units: every lifetime here is a proper decay length c*tau in **cm**.
   LLPCombine signal-key token (cm) and between the FullSim and FastSim file of a pair; any
   disagreement makes the point unusable for the scan.
 * The *target* lifetimes come from ``lifetime_scan.targets`` in the study YAML (or ``--targets``):
-  ``{source_cm: [target_cm, ...]}``.  The target equal to the source is the direct-MC reference.
+  ``{source_cm: [target_cm, ...]}``.  The target equal to the source is the direct-MC reference;
+  it is **always evaluated**, also when a target list (e.g. a ``--targets`` override) omits it,
+  because the identity check and every N_eff-ratio / reliability fraction are relative to it.
+  Each evaluated target has an origin: ``requested`` (in the nominal list), ``auto_direct``
+  (the source lifetime, added automatically) or ``crosscheck`` (``crosscheck_targets``); and a
+  role: ``direct`` | ``nominal`` | ``cross_check`` (below the source) | ``stress_test`` (above).
 * The signal key (``point``, e.g. ``gogoGZ_2300_1300_1000_10``) always keeps the *generated*
   lifetime, exactly as LLPCombine names the process; the target lives in its own column.
 """
@@ -128,34 +133,79 @@ class LifetimeScan:
             problems.append("quality.topk must be >= 5 (top-5 diagnostics)")
         return problems
 
-    def targets_for(self, source_cm: float, crosscheck: bool = True) -> list[float] | None:
-        """Nominal targets of a generated lifetime (+ the cross-check targets); None if not configured."""
-        out = None
-        maps = [self.targets] + ([self.crosscheck_targets] if crosscheck else [])
-        for mp in maps:
-            for s, t in mp.items():
-                if math.isclose(s, source_cm, rel_tol=0, abs_tol=1e-9):
-                    out = sorted(set(out or []) | set(t))
-        if out is not None and self.targets_for_nominal(source_cm) is None:
-            return None  # cross-check targets alone do not enable a source
-        return out
+    @staticmethod
+    def _same(a: float, b: float) -> bool:
+        return math.isclose(a, b, rel_tol=0, abs_tol=1e-9)
 
-    def targets_for_nominal(self, source_cm: float) -> list[float] | None:
-        for s, t in self.targets.items():
-            if math.isclose(s, source_cm, rel_tol=0, abs_tol=1e-9):
-                return sorted(t)
+    @classmethod
+    def _union(cls, *lists) -> list[float]:
+        out: list[float] = []
+        for lst in lists:
+            for t in lst:
+                if not any(cls._same(t, u) for u in out):
+                    out.append(float(t))
+        return sorted(out)
+
+    def _lookup(self, mp: dict, source_cm: float) -> list[float] | None:
+        for s, t in mp.items():
+            if self._same(s, source_cm):
+                return list(t)
         return None
 
+    def targets_for(self, source_cm: float, crosscheck: bool = True) -> list[float] | None:
+        """Every target evaluated for a generated lifetime: requested + direct reference (always) + cross-checks.
+
+        None if the source has no nominal target list (cross-check targets alone do not enable it).
+        """
+        nom = self._lookup(self.targets, source_cm)
+        if nom is None:
+            return None
+        extra = (self._lookup(self.crosscheck_targets, source_cm) or []) if crosscheck else []
+        return self._union(nom, [source_cm], extra)
+
+    def targets_for_nominal(self, source_cm: float, requested_only: bool = False) -> list[float] | None:
+        """Nominal targets incl. the direct reference (``requested_only``: exactly as requested)."""
+        nom = self._lookup(self.targets, source_cm)
+        if nom is None:
+            return None
+        return self._union(nom) if requested_only else self._union(nom, [source_cm])
+
+    def auto_direct(self, source_cm: float) -> bool:
+        """True when the direct reference was not requested and is added automatically."""
+        nom = self._lookup(self.targets, source_cm)
+        return nom is not None and not any(self._same(t, source_cm) for t in nom)
+
+    def crosscheck_for(self, source_cm: float) -> list[float]:
+        return self._union(self._lookup(self.crosscheck_targets, source_cm) or [])
+
+    def origin(self, source_cm: float, target_cm: float) -> str:
+        """requested | auto_direct | crosscheck (where an evaluated target comes from)."""
+        if any(self._same(t, target_cm) for t in (self._lookup(self.targets, source_cm) or [])):
+            return "requested"
+        if self._same(source_cm, target_cm):
+            return "auto_direct"
+        return "crosscheck"
+
     def role(self, source_cm: float, target_cm: float) -> str:
-        nom = self.targets_for_nominal(source_cm) or []
-        if any(math.isclose(t, target_cm, abs_tol=1e-9) for t in nom):
-            return "direct" if math.isclose(source_cm, target_cm, abs_tol=1e-9) else "nominal"
+        if self._same(source_cm, target_cm):
+            return "direct"
+        nom = self._lookup(self.targets, source_cm) or []
+        if any(self._same(t, target_cm) for t in nom):
+            return "nominal"
         return "cross_check" if target_cm < source_cm else "stress_test"
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        d["targets"] = {fmt_cm(k): v for k, v in self.targets.items()}
+        d["targets"] = {fmt_cm(k): v for k, v in self.targets.items()}  # as requested (YAML or --targets)
         d["crosscheck_targets"] = {fmt_cm(k): v for k, v in self.crosscheck_targets.items()}
+        d["auto_direct_references"] = [fmt_cm(k) for k in self.targets if self.auto_direct(k)]
+        d["evaluated_targets"] = {fmt_cm(k): self.targets_for(k) for k in self.targets}
+        d["target_policy"] = ("the direct reference (target = generated lifetime) is always evaluated; "
+                              "origin requested | auto_direct | crosscheck, role direct | nominal | cross_check | "
+                              "stress_test")
+        from .weights import policy_description
+
+        d["invalid_input_policy_table"] = policy_description()
         return d
 
 
@@ -171,6 +221,16 @@ def parse_targets(spec: str) -> dict[float, list[float]]:
         except ValueError as exc:
             raise ValueError(f"bad --targets element {part!r}: {exc}") from None
     return out
+
+
+def from_dict(d: dict) -> LifetimeScan:
+    """Rebuild the scan saved in a run's ``run_config.json`` (``LifetimeScan.to_dict``)."""
+    q = Quality(**{k: v for k, v in (d.get("quality") or {}).items() if k in Quality.__dataclass_fields__})
+    return LifetimeScan(targets={float(k): [float(x) for x in v] for k, v in (d.get("targets") or {}).items()},
+                        crosscheck_targets={float(k): [float(x) for x in v]
+                                            for k, v in (d.get("crosscheck_targets") or {}).items()},
+                        invalid_ctau_policy=d.get("invalid_ctau_policy", "llpcombine"), quality=q,
+                        representative_points=list(d.get("representative_points") or []))
 
 
 def from_config(raw: dict | None, targets_override: str | None = None, **quality_overrides) -> LifetimeScan:

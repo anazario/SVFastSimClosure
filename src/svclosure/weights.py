@@ -147,13 +147,73 @@ def weight_matrix(arrays, spec: WeightSpec, source_ctau_cm: float | None, target
     return out
 
 
-# event-level validity of the lifetime inputs (bit flags, recorded, never silently fixed)
-ANOM_NONFINITE = 1  # Xa_ctau or Xb_ctau is NaN/inf
-ANOM_NEGATIVE = 2  # Xa_ctau or Xb_ctau < 0  (unphysical proper decay length)
-ANOM_ZERO = 4  # Xa_ctau or Xb_ctau == 0
-ANOM_DECAYFLAGS = 8  # number of Evt_is{ZZ,GZ,GG} flags != 1 (DecayReweight -> 0 or last flag wins)
+# ----------------------------------------------------------------------------- invalid-input policy
+#
+# Event-level anomaly bits (int8 mask; recorded for every event, never silently "fixed").
+#
+#   bit  class                 condition                                  lifetime weight w(t)
+#   1    ctau_nonfinite        Xa_ctau or Xb_ctau is NaN or +-inf         NaN/inf for EVERY lifetime target,
+#                                                                         including the direct one (exp(nan*0))
+#   2    ctau_negative         Xa_ctau or Xb_ctau < 0 (finite or -inf)    finite, but outside the support of the
+#                                                                         exponential decay density: unphysical
+#   4    ctau_zero             Xa_ctau or Xb_ctau == 0                    finite and well defined: w = tau0/tau.
+#                                                                         Physically allowed (the density peaks at
+#                                                                         t = 0); an exact float zero is unusual
+#                                                                         for continuous generation and is recorded,
+#                                                                         but there is no generator-specific reason
+#                                                                         to treat it as a sentinel, so it is VALID
+#   8    decay_flags_none      no Evt_is{ZZ,GZ,GG} flag set               lifetime weight unaffected; LLPCombine's
+#                                                                         DecayReweight returns 0 (event weight 0)
+#   16   decay_flags_multiple  more than one Evt_is* flag set             DecayReweight: the last flag wins
+#
+# What each ``invalid_ctau_policy`` does with an event in a selection (POLICY_ACTIONS below):
+#
+#   class                 llpcombine (default)          exclude                       fail
+#   ctau_nonfinite        weighted as LLPCombine -> the  removed from every variant    run fails
+#                         weight is non-finite -> run   (incl. noreweight)
+#                         fails (NONFINITE_WEIGHT rule)
+#   ctau_negative         weighted as LLPCombine        removed from every variant    run fails
+#   ctau_zero             weighted (valid)              weighted (valid)              weighted (valid)
+#   decay_flags_none      weight 0, as LLPCombine       removed from every variant    run fails
+#   decay_flags_multiple  last flag wins, as LLPCombine removed from every variant    run fails
+#
+# NONFINITE_WEIGHT rule (all policies): after the policy is applied, any event that enters any
+# selection with a non-finite weight in any variant (whatever the cause: lifetime inputs, an
+# exp overflow, a non-finite evtFillWgt) makes the task fail with a per-event report; NaN/inf is
+# never accumulated into yields or covariances.  Under ``llpcombine`` the weights of every finite
+# event are bitwise those of ``ReweightTool``.
+ANOM_NONFINITE = 1
+ANOM_NEGATIVE = 2
+ANOM_ZERO = 4
+ANOM_DECAY_NONE = 8
+ANOM_DECAY_MULTI = 16
+ANOM_DECAYFLAGS = ANOM_DECAY_NONE | ANOM_DECAY_MULTI  # "decay_flags_not_one" (backward-compatible union)
 ANOM_NAMES = {ANOM_NONFINITE: "ctau_nonfinite", ANOM_NEGATIVE: "ctau_negative", ANOM_ZERO: "ctau_zero",
-              ANOM_DECAYFLAGS: "decay_flags_not_one"}
+              ANOM_DECAY_NONE: "decay_flags_none", ANOM_DECAY_MULTI: "decay_flags_multiple"}
+# (class name, bit mask) of the per-selection / per-file anomaly counters, in column order
+ANOM_CLASSES = (("any", 0x7F), ("ctau_nonfinite", ANOM_NONFINITE), ("ctau_negative", ANOM_NEGATIVE),
+                ("ctau_zero", ANOM_ZERO), ("decay_flags_not_one", ANOM_DECAYFLAGS),
+                ("decay_flags_none", ANOM_DECAY_NONE), ("decay_flags_multiple", ANOM_DECAY_MULTI))
+# per policy: bits that remove a selected event from every variant / that make the run fail
+INVALID_INPUT_BITS = ANOM_NONFINITE | ANOM_NEGATIVE | ANOM_DECAY_NONE | ANOM_DECAY_MULTI
+POLICY_ACTIONS = {
+    "llpcombine": dict(exclude=0, fail=0),
+    "exclude": dict(exclude=INVALID_INPUT_BITS, fail=0),
+    "fail": dict(exclude=0, fail=INVALID_INPUT_BITS),
+}
+INVALID_LIFETIME_WEIGHT = ANOM_NONFINITE | ANOM_NEGATIVE  # inputs for which w(t) is not a valid lifetime weight
+
+
+def policy_description() -> list[dict]:
+    """Machine-readable form of the table above (written to run_config.json)."""
+    rows = []
+    for bit, name in ANOM_NAMES.items():
+        rows.append(dict(cls=name, bit=bit, anomalous=True,
+                         lifetime_weight_valid=not bool(bit & INVALID_LIFETIME_WEIGHT),
+                         **{pol: ("fail" if a["fail"] & bit else "exclude" if a["exclude"] & bit else
+                                  ("fail_nonfinite_weight" if bit == ANOM_NONFINITE else "keep"))
+                            for pol, a in POLICY_ACTIONS.items()}))
+    return rows
 
 
 def lifetime_anomalies(arrays) -> np.ndarray:
@@ -166,8 +226,9 @@ def lifetime_anomalies(arrays) -> np.ndarray:
     with np.errstate(invalid="ignore"):
         code[(xa < 0) | (xb < 0)] |= ANOM_NEGATIVE
         code[(xa == 0) | (xb == 0)] |= ANOM_ZERO
-    nflag = sum(np.asarray(arrays[b], dtype=np.int8) != 0 for b in DECAY_BRANCHES)
-    code[nflag != 1] |= ANOM_DECAYFLAGS
+    nflag = sum((np.asarray(arrays[b]) != 0).astype(np.int8) for b in DECAY_BRANCHES)
+    code[nflag == 0] |= ANOM_DECAY_NONE
+    code[nflag > 1] |= ANOM_DECAY_MULTI
     return code
 
 

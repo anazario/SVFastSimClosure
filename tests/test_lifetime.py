@@ -187,7 +187,7 @@ def test_reference_selections(all_bins):
 # ----------------------------------------------------------------------------- end-to-end on a synthetic file
 
 
-def _synthetic_file(path: Path, bins, n=6000, seed=11, fastsim=False):
+def _synthetic_file(path: Path, bins, n=6000, seed=11, fastsim=False, nan_xa=0):
     import uproot
 
     rng = np.random.default_rng(seed)
@@ -210,6 +210,7 @@ def _synthetic_file(path: Path, bins, n=6000, seed=11, fastsim=False):
     xa = rng.exponential(10, n).astype(np.float32)
     xb = rng.exponential(10, n).astype(np.float32)
     xb[:3] = [-12.1, 0.0, 140.0]  # anomalies the real files contain
+    xa[3:3 + nan_xa] = np.nan  # optional: non-finite proper decay lengths (fatal once selected and reweighted)
     flags = rng.integers(0, 4, n)  # 3 = no flag -> DecayReweight 0
     data.update(evtFillWgt=rng.uniform(1e-3, 2e-3, n).astype(np.float32), Xa_ctau=xa, Xb_ctau=xb,
                 Evt_isZZ=flags == 0, Evt_isGZ=flags == 1, Evt_isGG=flags == 2)
